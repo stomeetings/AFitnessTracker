@@ -6,8 +6,7 @@ const ENGINES = [
   { id: "mediapipe", label: "MediaPipe Full" },
   { id: "yolo", label: "YOLOv11n-Pose GPU" },
 ] as const;
-const CAMERA_LABELS: Record<number, string> = { 0: "Laptop Webcam", 1: "Mobile Cam" };
-type CamInfo = { index: number; status: "active" | "ok" | "unavailable"; backend?: string; width?: number; height?: number; reason?: string };
+type CamInfo = { index: number; status: "active" | "ok" | "unavailable"; backend?: string; width?: number; height?: number; reason?: string; name?: string; label?: string };
 type CamScan = { active: number; available: number[]; cameras: CamInfo[]; devices: string[]; error: string | null };
 const SIDE_LABEL: Record<string, string> = { L: "Left", R: "Right", B: "Bilateral" };
 
@@ -61,7 +60,8 @@ function CameraPicker({ active, backend, error }: { active: number | undefined; 
   useEffect(rescan, []);
   useEffect(() => { if (wanted !== null && (active === wanted || error)) setWanted(null); }, [active, error, wanted]);  // switch finished, fell back, or failed
   const switching = wanted !== null;
-  const indices = [0, 1, 2, ...(scan?.cameras.filter((c) => c.status !== "unavailable").map((c) => c.index) ?? [])]
+  // only real devices: the active camera, plus anything the scan found working or Windows lists by name
+  const indices = [...(active !== undefined ? [active] : []), ...(scan?.cameras.filter((c) => c.status !== "unavailable" || c.name).map((c) => c.index) ?? [])]
     .filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => a - b);
   const info = (i: number) => scan?.cameras.find((c) => c.index === i);
   return (
@@ -80,9 +80,9 @@ function CameraPicker({ active, backend, error }: { active: number | undefined; 
           const dead = scan !== null && (st === "unavailable" || st === undefined);
           return (
             <button key={i} disabled={switching} onClick={() => { setWanted(i); post("/api/camera", { index: i }); }}
-              title={info(i)?.reason ?? (info(i) ? `${info(i)!.backend} ${info(i)!.width}x${info(i)!.height}` : `index ${i}`)}
+              title={[info(i)?.name, info(i)?.reason ?? (info(i) ? `${info(i)!.backend} ${info(i)!.width}x${info(i)!.height}` : `index ${i}`)].filter(Boolean).join(" · ")}
               className={`flex-1 rounded-md px-2 py-1.5 text-xs transition disabled:opacity-60 ${isActive ? "bg-emerald-500 text-slate-950" : wanted === i ? "bg-slate-700 text-slate-200" : dead ? "text-slate-500 hover:bg-slate-700" : "text-slate-300 hover:bg-slate-700"}`}>
-              {CAMERA_LABELS[i] ?? `Cam ${i}`} <span className="opacity-60">({i})</span>
+              {info(i)?.label ?? `Cam ${i}`} <span className="opacity-60">({i})</span>
               {!dead && scan && !isActive && <span className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 align-middle" />}
             </button>
           );
@@ -92,7 +92,7 @@ function CameraPicker({ active, backend, error }: { active: number | undefined; 
         {switching ? `switching to camera ${wanted}…` : error ?? `active: camera ${active ?? "…"}${backend ? ` · ${backend}` : ""}`}
       </div>
       {scan && scan.devices.length > 0 && (
-        <div className="mt-1 text-[10px] text-slate-600" title="Windows device names; order may not match indices">
+        <div className="mt-1 text-[10px] text-slate-600" title="DirectShow device names, in camera index order">
           devices: {scan.devices.join(" · ")}
         </div>
       )}

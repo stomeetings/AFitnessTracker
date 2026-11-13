@@ -33,6 +33,8 @@ class YoloEngine(PoseEngine):
             raise FileNotFoundError(f"{self.weights} missing; run scripts/download_models.py")
         self._model = YOLO(str(self.weights))
         self._model.to(self.device)
+        # warm-up: the first predict pays for CUDA/cuDNN init and model fusing; do it here, not on a live frame
+        self._model.predict(np.zeros((480, 640, 3), np.uint8), device=self.device, imgsz=self.imgsz, verbose=False)
 
     def infer(self, frame_bgr: np.ndarray, timestamp_ms: int) -> PoseResult | None:
         r = self._model.predict(frame_bgr, device=self.device, imgsz=self.imgsz, conf=self.min_conf, verbose=False)[0]

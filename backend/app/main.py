@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -67,17 +66,35 @@ def open_camera(index: int, warmup_s: float = CAMERA_WARMUP_S):
 
 
 def list_video_devices() -> list[str]:
-    """Windows camera device names (PnP). Order is NOT guaranteed to match OpenCV indices."""
-    # ponytail: name<->index mapping needs a DirectShow enumerator (pygrabber); names are shown as a hint only.
+    """DirectShow capture device names; list position == OpenCV CAP_DSHOW index. [] if enumeration fails."""
+    # ponytail: assumes MSMF enumerates in the same order as DirectShow (true on typical 1-2 camera setups);
+    # if a label ever disagrees with the picture, enumerate MSMF separately for cameras opened via msmf.
     try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -in 'Camera','Image' } | Select-Object -ExpandProperty Name"],
-            capture_output=True, text=True, timeout=8)
-        return [l.strip() for l in out.stdout.splitlines() if l.strip()]
+        import comtypes
+        from pygrabber.dshow_graph import FilterGraph
+        try:
+            comtypes.CoInitialize()     # called from a threadpool thread; COM init is per-thread
+        except OSError:
+            pass                        # already initialised in another mode
+        return FilterGraph().get_input_devices()
     except Exception as e:  # noqa: BLE001
         log.warning("device name listing failed: %s", e)
         return []
+
+
+def camera_label(name: str) -> str:
+    n = name.lower()
+    if "droidcam" in n:
+        return "Mobile Cam"
+    if "integrated" in n:
+        return "Laptop Webcam"
+    return name
+
+
+def default_camera_index() -> int:
+    """Index of the built-in webcam according to the DirectShow device list, else CAMERA_INDEX."""
+    names = list_video_devices()[:CAMERA_MAX + 1]
+    return next((i for i, n in enumerate(names) if camera_label(n) == "Laptop Webcam"), CAMERA_INDEX)
 
 
 class Worker(threading.Thread):
@@ -85,7 +102,7 @@ class Worker(threading.Thread):
 
     def __init__(self):
         super().__init__(daemon=True)
-        self.engine_name = "mediapipe"
+        self.engine_name = "yolo"
         self.pipeline = Pipeline(EXERCISE_NAMES[0])
         self.pending_engine: str | None = None
         self.pending_exercise: str | None = None
@@ -147,8 +164,14 @@ class Worker(threading.Thread):
             self.error = f"cannot open camera {self.camera_index} ({info})"   # keep running so the user can switch
         else:
             self.camera_info = info
-        engine = make_engine(ENGINES[self.engine_name][0], **ENGINES[self.engine_name][1])
-        engine.load()
+        try:
+            engine = make_engine(ENGINES[self.engine_name][0], **ENGINES[self.engine_name][1])
+            engine.load()               # YOLO load includes a dummy-frame warm-up inference
+        except Exception:  # noqa: BLE001  no GPU / missing weights must not kill the stream
+            log.exception("default engine %s failed to load, falling back to mediapipe", self.engine_name)
+            self.engine_name = "mediapipe"
+            engine = make_engine(ENGINES[self.engine_name][0], **ENGINES[self.engine_name][1])
+            engine.load()
         t0 = prev = time.perf_counter()
         while not self.stop_flag.is_set():
             engine = self._apply_pending(engine)
@@ -197,6 +220,7 @@ worker = Worker()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    worker.camera_index = default_camera_index()    # enumerated here, not on the worker thread that owns the capture
     worker.start()
     yield
     worker.stop_flag.set()
@@ -259,8 +283,11 @@ def cameras():
             cap.release()
             cams.append({"index": i, "status": "ok", **info})
     available = [c["index"] for c in cams if c["status"] != "unavailable"]
+    devices = list_video_devices()
+    for c, name in zip(cams, devices):      # cams is in index order, so position == index
+        c["name"], c["label"] = name, camera_label(name)
     return {"active": worker.camera_index, "available": available, "cameras": cams,
-            "devices": list_video_devices(), "error": worker.camera_error}
+            "devices": devices, "error": worker.camera_error}
 
 
 @app.post("/api/camera")
