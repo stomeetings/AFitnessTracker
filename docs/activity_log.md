@@ -138,6 +138,32 @@ Run tests: `backend\.venv\Scripts\python tests\test_analytics.py` from the repo 
 - Smoke test (scratch 8001, laptop cam held by the port-8000 server): scan 4.6 s → index 1 `ok msmf 640x480`, 2–4 unavailable; `POST index 4` fell back to camera 1 and streamed at 18.6 FPS. Tests 10/10, `tsc` + `vite build` clean.
 - `core.py` untouched: it holds analytics only; camera handling lives in `main.py`.
 
+## Session 3 — 2026-11-13 (personal PC)
+
+### Theme pass reverted
+
+- A frontend theme/drawer pass (`frontend/index.html`, `App.tsx`, `index.css`) plus a switch to `yolo11m` crashed the system. Everything uncommitted was discarded with `git restore .`; the tree went back to checkpoint `0991d26`. Do not retry `yolo11m` on the GTX 1050 without measuring VRAM first.
+- `docs/sample/mage_d3495f.jpg` is untracked and was left in place.
+
+### P1.4 — camera labels from real device names
+
+- `main.py` `list_video_devices()`: now uses pygrabber's DirectShow list (position == OpenCV `CAP_DSHOW` index) instead of the PowerShell PnP lookup. `camera_label(name)`: contains "droidcam" → "Mobile Cam", contains "integrated" → "Laptop Webcam", otherwise the real name. `GET /api/cameras` adds `name` and `label` to each camera entry.
+- `App.tsx`: hardcoded `CAMERA_LABELS` (`0: Laptop Webcam`, `1: Mobile Cam`) removed. Pills show the backend label and exist only for the active camera, cameras that opened in the scan, or devices Windows lists by name. Hover shows the full device name. No styling or layout changes. A device started after page load needs the rescan button.
+- `requirements.txt`: `pygrabber==0.2` added (version pinned from memory; drop the pin if pip rejects it). Install: `backend\.venv\Scripts\pip install pygrabber==0.2`. Without it pills fall back to "Cam N".
+- Assumption to verify live: MSMF numbers cameras in the same order as DirectShow. DroidCam opens only via MSMF on this machine (see P1.3), so if the "Mobile Cam" pill shows the laptop picture, MSMF needs its own enumeration.
+
+### P1.5 — startup defaults
+
+- Default engine is now `yolo` (YOLO11n-pose, `cuda:0`); MediaPipe stays in the UI toggle. If YOLO fails to load at startup the worker logs it and falls back to MediaPipe instead of dying.
+- `yolo_engine.py` `load()`: one dummy-frame inference (blank 640x480) so CUDA init is not paid on the first live frame. It also runs when switching to YOLO from the toggle. Startup takes a few seconds longer.
+- Default camera: `default_camera_index()` picks the first device labelled "Laptop Webcam", else index 0. It runs in `lifespan` before the worker starts, not on the capture thread.
+- Frame loop, overlay drawing and 20 Hz telemetry untouched.
+
+### Status at end of session 3
+
+- **Nothing in P1.4 / P1.5 has been run**: the assistant session had no shell, so no pip install, `tsc`, tests or live check. First job next session: install pygrabber, start the backend, confirm pills, default camera and YOLO startup, run the 10 tests and `tsc` + `vite build`.
+- Commit and push were handed to the user as commands; check `git log` / `git status` to see whether they were run. Files changed: `backend/app/main.py`, `backend/app/engines/yolo_engine.py`, `backend/requirements.txt`, `frontend/src/App.tsx`, `docs/activity_log.md`.
+
 ### Next: P2 persistence and upload mode
 
 SQLite + JSON report, recording mode A/B, H.264 recorder via imageio-ffmpeg, upload job worker process, session history with Recharts.
