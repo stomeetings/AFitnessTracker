@@ -1,1 +1,9 @@
 @import "tailwindcss";
+
+/* Exercise guide modal: fade/rise in (skipped for users who ask for reduced motion) */
+@keyframes dialog-in { from { opacity: 0; transform: translateY(8px); } }
+@keyframes backdrop-in { from { opacity: 0; } }
+@media (prefers-reduced-motion: no-preference) {
+  dialog[open] { animation: dialog-in 0.18s ease-out; }
+  dialog[open]::backdrop { animation: backdrop-in 0.18s ease-out; }
+}

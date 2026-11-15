@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Activity, AlertTriangle, Camera, Cpu, Footprints, Gauge, Loader2, RefreshCw, RotateCcw, ShieldAlert, Timer } from "lucide-react";
+import { Activity, AlertTriangle, Camera, Cpu, Footprints, Gauge, Info, Loader2, RefreshCw, RotateCcw, ShieldAlert, Timer } from "lucide-react";
+import { ExerciseGuide } from "./ExerciseGuide";
 import { useTelemetry, type Limb } from "./useTelemetry";
 
 const ENGINES = [
@@ -104,6 +105,10 @@ export default function App() {
   const { t, online } = useTelemetry();
   const [exercises, setExercises] = useState<string[]>([]);
   useEffect(() => { fetch("/api/exercises").then((r) => r.json()).then(setExercises).catch(() => {}); }, []);
+  const [guideInfo, setGuideInfo] = useState<Record<string, { rest: number; peak: number; sides?: string[] }>>({});
+  useEffect(() => { fetch("/api/exercise_info").then((r) => r.json()).then(setGuideInfo).catch(() => {}); }, []);
+  const [guideOpen, setGuideOpen] = useState(false);
+  const guide = t ? guideInfo[t.exercise] : undefined;
 
   const fall = t?.fall?.status ?? "NORMAL";
   const fallAlert = fall !== "NORMAL";
@@ -156,6 +161,10 @@ export default function App() {
                 className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm">
                 {exercises.map((x) => <option key={x}>{x}</option>)}
               </select>
+              <button onClick={() => setGuideOpen(true)} disabled={!guide} title="Exercise Guide" aria-label="Exercise Guide"
+                className="flex items-center rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm hover:bg-slate-700 disabled:opacity-50">
+                <Info size={14} />
+              </button>
               <button onClick={() => post("/api/reset")} title="Reset session"
                 className="flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm hover:bg-slate-700">
                 <RotateCcw size={14} /> Reset
@@ -184,6 +193,7 @@ export default function App() {
           )}
         </aside>
       </main>
+      {guideOpen && guide && t && <ExerciseGuide key={t.exercise} name={t.exercise} {...guide} onClose={() => setGuideOpen(false)} />}
     </div>
   );
 }

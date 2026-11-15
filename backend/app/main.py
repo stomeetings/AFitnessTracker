@@ -245,6 +245,12 @@ def exercises():
     return EXERCISE_NAMES
 
 
+@app.get("/api/exercise_info")
+def exercise_info():
+    """Rest/peak target angles and tracked sides (L/R, or B = bilateral) per exercise, for the frontend guide."""
+    return {name: {"rest": cfg["rest"], "peak": cfg["peak"], "sides": list(cfg["joints"])} for name, cfg in EXERCISES.items()}
+
+
 @app.get("/api/telemetry")
 def telemetry():
     return worker.telemetry()
