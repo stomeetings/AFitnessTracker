@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from app.engines import PoseResult
+from app.pipeline.escalation import Escalation
 from app.pipeline.fall_detector import FallDetector
 from app.pipeline.kinematics import EMA, joint_angles
 from app.pipeline.mobility import Mobility
@@ -16,6 +17,7 @@ class Pipeline:
         self.reps = RepCounter(exercise)
         self.mobility = Mobility()
         self.fall = FallDetector()
+        self.escalation = Escalation()      # not cleared by reset(): resetting reps must not hide an alarm
         self.last: dict = {}
 
     @property
@@ -39,10 +41,11 @@ class Pipeline:
             self.reps.update(angles, t)
             self.mobility.update(res, t, self.reps.active())
         fall = self.fall.update(res, t)
+        fall["alert"] = self.escalation.update(fall, t)
 
         if res is None:
             posture = "unknown"
-        elif fall["tilt_deg"] is not None and fall["tilt_deg"] > 55:
+        elif fall["on_floor"] or (fall["tilt_deg"] is not None and fall["tilt_deg"] > 55):
             posture = "lying"
         elif angles.get("knee_mean", 180) < SITTING_KNEE_DEG:
             posture = "sitting"

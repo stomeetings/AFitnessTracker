@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Activity, AlertTriangle, Camera, Cpu, Footprints, Gauge, Info, Loader2, RefreshCw, RotateCcw, ShieldAlert, Timer } from "lucide-react";
 import { ExerciseGuide } from "./ExerciseGuide";
+import { FallCheck } from "./FallCheck";
 import { useTelemetry, type Limb } from "./useTelemetry";
 
 const ENGINES = [
@@ -112,6 +113,7 @@ export default function App() {
 
   const fall = t?.fall?.status ?? "NORMAL";
   const fallAlert = fall !== "NORMAL";
+  const alert = t?.fall?.alert;
 
   return (
     <div className="min-h-screen p-6">
@@ -126,7 +128,12 @@ export default function App() {
       <header className="mb-6 flex items-center gap-3">
         <Activity className="text-emerald-400" />
         <h1 className="text-xl font-semibold">AI Rehab Tracker</h1>
-        <span className="ml-auto rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">P1 · single patient</span>
+        {/* TEMP: remove with POST /api/fall/test once the fall dialog has been tested */}
+        <button onClick={() => post("/api/fall/test")} title="Simulate a fall to test the Are-you-okay dialog (temporary)"
+          className="ml-auto rounded-full border border-amber-600 px-3 py-1 text-xs text-amber-300 hover:bg-amber-500/10">
+          Test Fall
+        </button>
+        <span className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">P1 · single patient</span>
       </header>
 
       <main className="grid gap-6 lg:grid-cols-[1fr_360px]">
@@ -193,7 +200,8 @@ export default function App() {
           )}
         </aside>
       </main>
-      {guideOpen && guide && t && <ExerciseGuide key={t.exercise} name={t.exercise} {...guide} onClose={() => setGuideOpen(false)} />}
+      {guideOpen && guide && t && <ExerciseGuide info={guideInfo} initial={t.exercise} onClose={() => setGuideOpen(false)} />}
+      {alert && (alert.state === "COUNTDOWN" || alert.state === "ALERTED") && <FallCheck alert={alert} />}
     </div>
   );
 }

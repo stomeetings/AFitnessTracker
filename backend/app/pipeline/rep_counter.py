@@ -13,6 +13,12 @@ EXERCISES = {
     "Hip Flexion":    {"joints": {"L": "l_hip", "R": "r_hip"},           "rest": 170, "peak": 110},
     # ponytail: mean knee angle only; add hip-height-vs-knee gating if seated leg swings false-count.
     "Sit-to-Stand":   {"joints": {"B": "knee_mean"},                     "rest": 100, "peak": 165},
+    # Added in the library expansion. Angles are first-pass values pending physio review.
+    "Overhead Reach":        {"joints": {"L": "l_shoulder", "R": "r_shoulder"}, "rest": 20,  "peak": 150},
+    "Seated Knee Extension": {"joints": {"L": "l_knee", "R": "r_knee"},         "rest": 95,  "peak": 165},
+    "Mini Squat":            {"joints": {"B": "knee_mean"},                     "rest": 170, "peak": 115},
+    "Side Leg Raise":        {"joints": {"L": "l_hip_abd", "R": "r_hip_abd"},   "rest": 92,  "peak": 120},
+    "Wall Push-up":          {"joints": {"B": "elbow_mean"},                    "rest": 165, "peak": 95},
 }
 
 IDLE, FLEXING, PEAK, RETURNING = "IDLE", "FLEXING", "PEAK", "RETURNING"

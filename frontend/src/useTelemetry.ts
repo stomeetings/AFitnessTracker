@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 export type Limb = { reps: number; state: string; angle: number | null; last_rom: number; best_rom: number };
+export type FallAlert = { state: "IDLE" | "COUNTDOWN" | "ALERTED" | "ACKNOWLEDGED"; seconds_left: number; impact: boolean };
 export type Telemetry = {
   camera_index: number;
   camera_backend: string | null;
@@ -15,7 +16,7 @@ export type Telemetry = {
   angles?: Record<string, number>;
   reps?: Record<string, Limb>;
   mobility?: { state: string; steps: number; cadence_spm: number };
-  fall?: { status: "NORMAL" | "SUSPECTED" | "CONFIRMED"; tilt_deg: number | null; drop_velocity: number; aspect_ratio: number | null; seconds_in_state: number | null };
+  fall?: { status: "NORMAL" | "SUSPECTED" | "CONFIRMED"; tilt_deg: number | null; drop_velocity: number; aspect_ratio: number | null; seconds_in_state: number | null; alert?: FallAlert };
   posture?: string;
 };
 

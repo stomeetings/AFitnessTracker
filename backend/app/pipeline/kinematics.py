@@ -24,18 +24,27 @@ def angle_deg(a, b, c) -> float | None:
 
 
 def joint_angles(res: PoseResult, min_conf: float = 0.5, use_3d: bool = True) -> dict[str, float]:
-    """Returns e.g. {'l_elbow': 92.1, 'r_knee': 171.0, 'knee_mean': ..., 'hip_mean': ...}. Missing joints are omitted."""
+    """Returns e.g. {'l_elbow': 92.1, 'r_knee': 171.0, 'l_hip_abd': 93.0, 'knee_mean': ...}. Missing joints are omitted.
+
+    `{side}_hip_abd` is the angle at the hip between the pelvis line (to the other hip) and the thigh:
+    about 90 standing, larger as the leg lifts out to the side.
+    """
     out: dict[str, float] = {}
-    for side in "lr":
+
+    def put(key: str, names: tuple[str, str, str]) -> None:
+        kps = [res.get(n, min_conf) for n in names]
+        if not all(kps):
+            return
+        pts = [k.world for k in kps] if use_3d and all(k.world for k in kps) else [(k.x, k.y) for k in kps]
+        ang = angle_deg(*pts)
+        if ang is not None:
+            out[key] = ang
+
+    for side, other in ("lr", "rl"):
         for joint, names in TRIPLES.items():
-            kps = [res.get(f"{side}_{n}", min_conf) for n in names]
-            if not all(kps):
-                continue
-            pts = [k.world for k in kps] if use_3d and all(k.world for k in kps) else [(k.x, k.y) for k in kps]
-            ang = angle_deg(*pts)
-            if ang is not None:
-                out[f"{side}_{joint}"] = ang
-    for joint in ("knee", "hip"):
+            put(f"{side}_{joint}", tuple(f"{side}_{n}" for n in names))
+        put(f"{side}_hip_abd", (f"{other}_hip", f"{side}_hip", f"{side}_knee"))
+    for joint in ("knee", "hip", "elbow"):
         vals = [out[k] for k in (f"l_{joint}", f"r_{joint}") if k in out]
         if vals:
             out[f"{joint}_mean"] = sum(vals) / len(vals)

@@ -305,6 +305,20 @@ def camera(c: Camera):
     return {"ok": True}
 
 
+@app.post("/api/fall/ack")
+def fall_ack():
+    """"I'm OK": answers the fall countdown or silences a raised alert."""
+    worker.pipeline.escalation.ack()    # only raises a flag; the worker thread applies it on its next frame
+    return {"ok": True}
+
+
+@app.post("/api/fall/test")
+def fall_test():
+    """TEMP (Test Fall button): simulate a confirmed fall so the countdown dialog can be tried without falling."""
+    worker.pipeline.escalation.simulate()
+    return {"ok": True}
+
+
 @app.post("/api/reset")
 def reset():
     worker.pending_reset = True
