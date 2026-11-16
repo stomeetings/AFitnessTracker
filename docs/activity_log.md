@@ -164,6 +164,105 @@ Run tests: `backend\.venv\Scripts\python tests\test_analytics.py` from the repo 
 - **Nothing in P1.4 / P1.5 has been run**: the assistant session had no shell, so no pip install, `tsc`, tests or live check. First job next session: install pygrabber, start the backend, confirm pills, default camera and YOLO startup, run the 10 tests and `tsc` + `vite build`.
 - Commit and push were handed to the user as commands; check `git log` / `git status` to see whether they were run. Files changed: `backend/app/main.py`, `backend/app/engines/yolo_engine.py`, `backend/requirements.txt`, `frontend/src/App.tsx`, `docs/activity_log.md`.
 
+## Session 4 — 2026-11-15 (personal PC)
+
+### Audio-visual form correction: built, then fully reverted
+
+- A form-rule checker (`pipeline/form.py`), red/green skeleton, voice cues and a "Form check" switch were built and then removed at the user's request (the Elbow Curl rule false-fired on 2D YOLO angles). `form.py` is deleted; nothing references it. Do not assume any of it exists.
+
+### Exercise Guide (commit `93168df`, pushed on `feature/exercise-guide`)
+
+- `frontend/src/ExerciseGuide.tsx`: modal opened from the info button next to the exercise dropdown. Full-body skeleton with glowing joints, dashed angle arcs and degree labels, left/right alternating demo, Left and Right stat cards, big angle readout.
+- `GET /api/exercise_info` returns `{name: {rest, peak, sides}}` from `rep_counter.EXERCISES`.
+- Later reworked (uncommitted, see below): one config row per exercise in `GUIDES`, plus a tab row to browse every exercise without changing the tracked one. Arm exercises are drawn front-on, leg exercises in a 3/4 view. The figure faces the viewer, so its right side is on the viewer's left.
+
+### Fall escalation (Phase 1) and fall-check dialog (Phase 2)
+
+- `backend/app/pipeline/escalation.py` (new): `IDLE -> COUNTDOWN -> ALERTED`, or `ACKNOWLEDGED`. `COUNTDOWN_S = 10.0` for every fall. Getting up clears `COUNTDOWN` and `ALERTED`; "I'm OK" (`POST /api/fall/ack`) answers either. `fired` is true for one frame when `ALERTED` is entered (hook for a future notifier).
+- Telemetry: `fall.alert = {state, seconds_left, impact}`; `fall` also carries `impact` and `on_floor`.
+- `frontend/src/FallCheck.tsx` (new): full-screen dialog while state is `COUNTDOWN` or `ALERTED`. Seconds ring, "I'm OK" button, beep each second, spoken "Are you okay?", red screen and two-tone alarm when unanswered. Esc is disabled. Shows a hint if the browser is blocking sound.
+- **Temporary test hook, kept on purpose by the user:** amber "Test Fall" button in the header, `POST /api/fall/test`, and `Escalation.simulate()` / `_test`. All three are marked `TEMP`. A simulated countdown is not cancelled by standing up; only "I'm OK" ends it.
+
+### Fall detector changes (`backend/app/pipeline/fall_detector.py`)
+
+- **Dwell:** a floor posture shows `SUSPECTED` at once and becomes `CONFIRMED` only after `DWELL_S = 5.0` continuously down. The old "1.5 s still" rule, `STILL_V` and `SUSPECT_TIMEOUT_S` are gone. Alarm therefore sounds 15 s after going down.
+- **Recovery:** upright for `RECOVER_S = 0.5` returns to `NORMAL` from any state.
+- **Pose lost:** counts as still down for `LOST_AFTER_DOWN_S = 6.0` after a drop or a floor posture.
+- **New floor cues**, added because lying on the floor read as NORMAL:
+  - torso keypoints missing -> box wider than `ASPECT_LYING = 1.6` (unless shoulders span over half the box: close-up);
+  - `flat`: shoulders-to-legs vertical extent under `FLAT_EXTENT = 0.8` torso (needs no standing baseline or ankles);
+  - `compressed`: lying feet-toward-camera (reference `docs/sample/image_9379a9.jpg`, skeleton upright on screen, tilt 3 deg). Shoulder-to-ankle height under `COMPRESSED = 0.55` and hip-to-ankle under `LEGS_SHORT = 0.27` of the standing height seen earlier at the same ankle-y bin (`_stand`, 40 px bins, session-long);
+  - `inverted`: shoulders below ankles in the image (head toward camera).
+- Known limits: `compressed` needs the person to have stood near that spot earlier in the session; keypoints for the reference test were read off the screenshot by eye; a deep squat or floor sitting held 5 s, floor exercises, or standing under a very steep camera can start the countdown.
+- `core.py`: posture is "lying" when `on_floor`.
+
+### Exercise library (Phase 4)
+
+- `rep_counter.EXERCISES` gained Overhead Reach (shoulder 20->150), Seated Knee Extension (knee 95->165), Mini Squat (`knee_mean` 170->115), Side Leg Raise (`l/r_hip_abd` 92->120), Wall Push-up (`elbow_mean` 165->95). Angles are first-pass values pending physio review.
+- `kinematics.py`: `{side}_hip_abd` (other hip - hip - knee) and `elbow_mean`.
+- Hamstring Curl and Lateral Arm Raise were not added: they duplicate Knee Flexion and Shoulder Raise. Heel-Toe Balance needs a hold timer and is deferred.
+
+### Deferred by the user
+
+- WhatsApp emergency alerts. Design was: self-hosted Evolution API in Docker, `backend/app/notify.py` on a daemon thread triggered by `Escalation.fired`, text then optional snapshot. Risks noted: unofficial API (use a dedicated SIM), patient image leaves the machine.
+
+### Status at end of session 4
+
+- **Tests:** `backend/.venv/Scripts/python tests/test_analytics.py` -> 21/21 passed on the last run. That run was before the Test Fall hook was removed and then restored; re-run to confirm. `npx tsc --noEmit` in `frontend` was clean before the fall-detector and dialog timing changes; re-run too.
+- **The assistant session has no shell.** The user runs commands with the `!` prefix, one per prompt, through bash: use forward slashes, and `cd` persists between commands.
+- **Git, as last seen:** branch `feature/exercise-guide`, last commit `93168df` (Exercise Guide), pushed. Everything after it was uncommitted: escalation, FallCheck, new exercises, guide refactor, fall detector changes. `git checkout main` was refused because of those uncommitted changes. Check `git status` and `git log` first thing.
+- **Commands still to run, in order** (from the repo root):
+  1. `git add backend/app frontend/src tests` then `git status` (`docs/sample/` should stay untracked: it holds a photo of a person at home and a third-party UI screenshot)
+  2. `git commit -m "Add robust floor fall detection with 5s dwell, auto-recovery, and 10s countdown (keeping test button)"`
+  3. `git push`
+  4. `git checkout main`, `git merge feature/exercise-guide`, `git push origin main` (`main` is still at `0991d26`, so this fast-forwards and brings the whole branch across)
+- **Never run live by the assistant:** camera pills and pygrabber (`backend/.venv/Scripts/pip install pygrabber==0.2`), YOLO default with warm-up, the look of all ten guide animations (Wall Push-up, Overhead Reach, Seated Knee Extension most likely to need tweaks), the fall dialog layout and sound, and the real lying-on-floor case. If a real fall still shows NORMAL, capture the `fall` section of `GET /api/telemetry` while down.
+- This log entry itself is uncommitted; `docs/activity_log.md` is not in the `git add` line above, so add it explicitly.
+
+## Session 5 — 2026-11-16 (personal PC)
+
+### Roadmap review (no code changed)
+
+- Reviewed four upgrade areas: clinical biomechanics (tempo, symmetry, compensation), voice check-in with
+  emergency alerts, persistence and reporting, privacy mode and low-light handling.
+- Main findings: everything is feasible without frame-loop cost except CLAHE, which is per-frame work. Python
+  threads share one interpreter lock, so CPU-heavy background work needs a separate process, not a thread.
+  The system has no login and stores nothing yet. After "I'm OK" the system never asks again if the person
+  stays down (fixed by the re-check in plan 02).
+- Browser speech recognition was rejected for voice check-in: Chrome sends audio to Google by default and
+  on-device support is experimental. Decision: local Sherpa-ONNX on the backend machine instead.
+
+### Two implementation plans written (`docs/plans/`), to be implemented in order
+
+1. `01_TIMINGS_AND_PRIVACY.md` — per-stage timing telemetry (`capture`, `infer`, `pipeline`, `draw`, `encode`)
+   to set the FPS/latency baseline, and Privacy Mode (backend blanks the frame before `draw()`; header switch;
+   video hidden until the backend confirms, so a restart cannot leak raw frames).
+2. `02_SHERPA_STT_AND_RECHECK.md` — offline English speech recognition in a separate process, microphone open
+   only while the fall dialog is showing and only after the spoken prompt ends; intent rules (help/negative
+   escalates, clear multi-word affirmative cancels, anything else lets the countdown run); "Trigger Emergency"
+   button; 2-minute re-check after an acknowledgement if the person is still down.
+
+Each plan is self-contained (file paths, schema changes, tests, acceptance checks) for a fresh session.
+
+### Standing rule from the user
+
+**Never remove or break an existing working feature.** Stand-up auto-recovery, the spoken "Are you okay?"
+prompt, the manual "I'm OK" button and the "Test Fall" button all stay. Voice input and Privacy Mode are purely
+additive.
+
+### Explicitly excluded for now
+
+SQLite/PostgreSQL logging, trend charts, PDF reports, Twilio/WhatsApp/SMS alerts, WebRTC caregiver view.
+
+### Still open from session 4 (unchanged)
+
+- Check `git status` / `git log` first: at last sight everything after commit `93168df` was uncommitted and
+  `main` was still at `0991d26`. `docs/plans/` and this log entry are new and uncommitted too.
+- Never verified live: camera pills and pygrabber, YOLO warm-up, the ten guide animations, the fall dialog's
+  look and sound, the real lying-on-floor case.
+- The speech model named in plan 02 and its Python API must be confirmed against the Sherpa-ONNX docs before
+  coding; they were taken from documentation search results, not from a working install.
+
 ### Next: P2 persistence and upload mode
 
 SQLite + JSON report, recording mode A/B, H.264 recorder via imageio-ffmpeg, upload job worker process, session history with Recharts.
