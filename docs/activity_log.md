@@ -263,6 +263,284 @@ SQLite/PostgreSQL logging, trend charts, PDF reports, Twilio/WhatsApp/SMS alerts
 - The speech model named in plan 02 and its Python API must be confirmed against the Sherpa-ONNX docs before
   coding; they were taken from documentation search results, not from a working install.
 
+### Plan 01 (timings and Privacy Mode) — implemented, NOT yet verified
+
+Implemented by a Sonnet 5.5 session that had no shell, so none of the checks below have been run. Plan 02 was not
+touched. No existing feature was removed (Test Fall button and endpoint, fall dialog, stand-up recovery, rep
+counting all unchanged); `annotate.py`, `fall_detector.py`, `escalation.py`, `FallCheck.tsx` and
+`ExerciseGuide.tsx` were not edited.
+
+- `backend/app/main.py`: `time.perf_counter()` marks around capture / infer / pipeline / draw / encode, smoothed
+  0.9/0.1 into `Worker.timings`, reported as `timings` in telemetry (`fps` and `latency_ms` unchanged).
+  `Worker.privacy` set through `POST /api/config {"privacy": bool}`. When on, the frame is blanked in place
+  (`frame[:] = 0`) after inference and `pipeline.process()` and before `draw()`, so the skeleton and box are drawn
+  on black and raw video is never JPEG-encoded.
+- Two additions beyond the plan, both to make "raw video never leaves the backend" hold:
+  - Telemetry `privacy` is true only after a blanked frame has actually been published (`jpeg_private`), not
+    merely when the flag is set, so the UI's confirmation is truthful.
+  - `mjpeg()` skips a stored frame that was encoded before privacy was switched on, so a client that connects
+    in that moment cannot receive one stale raw frame.
+- `frontend/src/useTelemetry.ts`: `timings` and `privacy` in the `Telemetry` type.
+- `frontend/src/App.tsx`: "Privacy" switch in the header (left of Test Fall; `ml-auto` moved to it); preference in
+  `localStorage` key `privacy`; re-posted to the backend when it disagrees with telemetry (also after a reconnect);
+  the `<img>` gets `invisible` until the backend is online and reports `privacy: true`; a small timings line under
+  the FPS/Latency cards.
+- No new unit tests, as the plan specifies (the analytics pipeline is unchanged; `app.main` must not be imported
+  in tests).
+
+**To verify, in order** (acceptance checks in `docs/plans/01_TIMINGS_AND_PRIVACY.md` section 5):
+1. `backend/.venv/Scripts/python tests/test_analytics.py` -> expect `21/21 passed`.
+2. `cd frontend && npx tsc --noEmit; cd ..` -> expect no output.
+3. Live: the timings line appears; with privacy on the stream is skeleton-on-black, `encode_ms` is not higher
+   and `fps` not lower than with it off; 5 reps count the same in both modes; Test Fall dialog works in both;
+   after turning privacy on and restarting the backend the video stays hidden until the stream is black.
+4. Record the five `timings` values (60 s, privacy off) here as the reference for Plan 02. The baseline `fps` and
+   `latency_ms` from before the change were not captured, since no shell was available to run the old code;
+   compare against what the dashboard showed before this session if you remember it.
+5. Known limit: after a backend restart the MJPEG `<img>` does not reconnect by itself, so the page needs a
+   reload (this was already the case before; hidden-until-confirmed still protects the reload).
+
+Once 1-4 pass, mark this section verified and start `02_SHERPA_STT_AND_RECHECK.md`.
+
+### Plan 02 (offline voice check-in + 2-minute re-check) — implemented, NOT yet verified
+
+Implemented by a Sonnet 5.5 session with no shell: nothing below has been run, installed or downloaded. Existing
+behaviour was kept (stand-up recovery, spoken prompt, beeps, "I'm OK", Test Fall button/endpoint, `fall_detector.py`
+untouched, existing tests unmodified).
+
+- `backend/app/voice/` (new): `intent.py` (asymmetric `classify`: help/negative first, only "I am okay/fine/..."
+  cancels), `stt_process.py` (Sherpa-ONNX streaming English, CPU, own process, idle until "start", mic open only
+  while listening; finds model files by prefix, int8 encoder/joiner), `listener.py` (`VoiceListener`: reader thread,
+  acts on final sentences only).
+- `backend/app/pipeline/escalation.py`: `escalate()` (COUNTDOWN -> ALERTED at once), `RECHECK_S = 120` (ACKNOWLEDGED
+  while still down -> new COUNTDOWN), `rechecks` in `fall.alert`. Simulated (Test Fall) episodes never re-check.
+- `backend/app/main.py`: `voice` listener started in `lifespan`; `POST /api/fall/listen`, `POST /api/fall/escalate`;
+  one `voice.active` check per frame (stops the mic when the dialog is gone); `fall.voice` in telemetry.
+- `frontend/src/FallCheck.tsx`: microphone is requested (`/api/fall/listen`) only after the spoken prompt ends + 300 ms
+  (6 s fallback), with a guard against the end event of a cancelled prompt; status line ("Listening…", `Heard: "…"`,
+  "Voice unavailable — use the buttons"); red "Trigger Emergency" button beside "I'm OK" (countdown only); heading
+  "Still down — are you okay?" on re-checks. Layout: dialog scrolls, content `min-h-full`.
+- `backend/requirements.txt`: `sherpa-onnx`, `sounddevice` (unpinned: pin after installing).
+  `backend/scripts/download_models.py --stt` fetches the model; `backend/scripts/stt_smoke.py` is the mic check.
+- Tests added to `tests/test_analytics.py`: intent table (incl. the documented echo risk), model-file picking,
+  escalate, escalate-while-idle, re-check, no re-check after standing, two re-check rounds, Test Fall unchanged.
+
+**Assumptions to confirm** (taken from docs/search results, not from a working install):
+1. ~~`sherpa-onnx` and `sounddevice` have wheels for Python 3.13 on this machine.~~ CONFIRMED 2026-11-16: pip installed
+   `sherpa-onnx 2.0.1` (cp313 win_amd64 wheel) + `sherpa-onnx-core 2.0.1`; `sounddevice 0.5.6` was already present.
+   Pin them in `requirements.txt` (`sherpa-onnx==2.0.1`, `sounddevice==0.5.6`).
+2. The model archive URL and file names (`...-epoch-99-avg-1-chunk-16-left-128[.int8].onnx`); a subagent read them
+   from a summary of the docs page, not verbatim. Still unconfirmed until `download_models.py --stt` has run.
+3. ~~`OnlineRecognizer.from_transducer(...)` arguments~~ CONFIRMED against the installed 2.0.1 source
+   (`sherpa_onnx/online_recognizer.py`): `from_transducer` accepts every keyword the code passes (`tokens, encoder,
+   decoder, joiner, num_threads, sample_rate, feature_dim, enable_endpoint_detection, rule1/2/3_*, decoding_method,
+   provider`); `get_result` returns `str`; `create_stream / decode_stream / is_ready / is_endpoint / reset` exist.
+   `OnlineStream.accept_waveform` lives in the compiled extension and was not checked, only seen in the official example.
+4. `multiprocessing` "spawn" works under the way uvicorn is launched here (child imports only `app.voice.stt_process`).
+
+**Verified so far (user ran these, 2026-11-16):** `pip install -r backend/requirements.txt` OK (sherpa-onnx 2.0.1);
+`download_models.py --stt` OK and the unpacked file names match `find_model_files` exactly (int8 encoder/joiner, fp32
+decoder, `tokens.txt`); first `stt_smoke.py` run: the speech process spawned, the model loaded, the microphone opened
+and audio reached the recogniser (default device 44.1 kHz, resampled to 16 kHz). No sentence was printed, but that run
+went through `!`, which shows output only after the command ends, so the speaking window could not be timed.
+`stt_smoke.py` now also reports the loudest microphone sample (silent mic vs. no words recognised); the child sends a
+`("level", peak)` event on stop and the backend logs it. Recognition itself is still unverified: re-run the smoke
+script in a normal terminal window.
+Second run (normal terminal): 0 sentences, loudest sample 0.000 = the default input device delivers pure silence
+(suspects: DroidCam's virtual microphone as Windows default, Windows microphone privacy for desktop apps, muted or
+wrong device). Added `stt_smoke.py --devices` (measures every input device for 1 s); the chosen device is passed to
+the backend with the `STT_INPUT_DEVICE` environment variable (number or part of the name).
+`--devices` result: Windows default input = "Microphone (DroidCam Audio)" (peak 0.000, silent unless the phone streams
+audio); "Microphone (Realtek Audio)" = laptop mic, peak 0.086 (chosen); "Microphone (2- KORP THALLIUM)" = headset,
+peak 1.000 (clipping, not on the patient). A name in `STT_INPUT_DEVICE` is resolved by `resolve_device` against the
+default audio API only (sounddevice's own lookup can match one microphone once per audio API). Persist with
+`setx STT_INPUT_DEVICE "Realtek"` (new windows only). New test: `test_resolve_device_uses_default_audio_api_only`
+(31 tests expected in total).
+Third smoke run (laptop mic, loudest sample 0.108): recognition works end to end (partials and finals stream, `classify`
+runs), but three attempts at "I am okay" were heard as "I AM", "I AM LOOKING", "I AM ODY" -> all `None` (safe: the
+countdown continues). Likely causes: low input level, accent, small model. "help" and "I am fine" not yet tested.
+Next: raise the Windows input level, retry with "I am fine" / "help" / "I need help" / "I am not okay"; if "fine" and
+"help" are reliable add a hint to the Listening line ("say I am fine or help"); if recall stays poor with a good level,
+consider a larger Sherpa model (bigger download, slower decode).
+Fixes after the fourth smoke run (loudest sample 0.152; "I am okay" heard as "I AM WICKED"; "I am fine" split into
+finals 'I' + 'AM FINE'): (1) `stt_process.py` `RULE1_S = 2.4`, `RULE2_S = 1.5` (the code already used sherpa's defaults
+2.4 / 1.2, so the real change is rule2 1.2 -> 1.5 s; an answer is acted on 1.5 s after the last word). (2) software gain
+`GAIN = 3.0` (env `STT_GAIN`, 1 = off) via `boost()`: it backs off so recent peaks stay under 0.95 and never clips
+or attenuates; the diagnostic peak stays the RAW level. (3) `intent.py`: leading "I" optional ("am fine", "am okay",
+"i'm ok", "all good", "doing fine/okay"); bare "okay"/"yes"/"fine"/"good" still `None`; "not" and any `n't` form now
+escalate like "help"/"no". Tests added: `test_intent_accepts_sentences_cut_by_endpointing`,
+`test_gain_boosts_quiet_audio_without_clipping` (33 tests expected). Not fixed by any of this: accent / the small
+model; a pause longer than 1.5 s inside a sentence still splits it (joining consecutive finals would cover that).
+Result of the gain fix: loudest sample 0.302 (was ~0.15). Next tweak: `stt_process.finished()` ends a sentence as soon as
+the text classifies as a clear affirmative ("I am fine", "am okay", ...) instead of waiting RULE2_S, so repeats and
+trailing words ("I am fine I am fine I ...") are not glued on. Chosen without a settle delay because the model's text
+only changes once per ~0.6 s chunk. Help / negative text is never finished early (a partial "NO" can become "NOW").
+Trade-off: "I am fine, but I can't get up" is cut at "fine" if the "but" is not in the same decode chunk; the 2-minute
+re-check is the backstop. Test added: `test_clear_affirmative_finishes_the_sentence_at_once` (34 tests expected).
+Next round (user reported "fine" heard as KIND / FIGHT / FIVE and "okay" as OCHING): the 0.302 was the RAW level, so 3x
+put loud syllables near/over full scale (the limiter only reacts after a loud sound). Changes: `GAIN` 3.0 -> 1.5,
+`RULE2_S` 1.5 -> 0.8; `finished()` now also ends a sentence on a STRONG distress word (help, emergency, ambulance,
+hurt(s), pain, cannot, stuck, fall/fallen/fell, sick, dizzy) - weak ones (no, not, bad) still wait for the end of the
+sentence because a partial "NO" is often the start of "NOW" and a likely noise artefact (they still escalate, <= 0.8 s
+later); `intent.py`: those distress words added, and after am / i am / i'm the near-misses oky, okey, five, kind, fight
+(plus well) count as "ok" (bare words still `None`, any negative still wins). The function is `classify` (not
+`parse_intent`; kept so nothing breaks). Known consequence: "I am five years old" classifies as "ok". Tests: finishing
+test updated (help / cannot now finish early on purpose), `test_intent_accepts_phonetic_near_misses_only_after_i_am`,
+`test_voice_settings_stay_gentle` (36 tests expected).
+Live testing then showed a soft "help" transcribed as "HELL" / "HELD" (-> `None`): both added to the help words
+(weak tier: they wait for the end of the sentence, because a partial "HELL" can become "HELLO"); "oke" and "ache"
+(= "okay" in some accents) added to the near-misses accepted right after am / i am / i'm. `test_intent_near_misses_seen_in_live_testing`
+(37 tests expected). Note: "ache" is NOT a distress word on its own, so "my back ache" is `None`.
+
+**To verify, in order** (acceptance checks 1-10 in `docs/plans/02_SHERPA_STT_AND_RECHECK.md` section 7):
+1. `backend/.venv/Scripts/python tests/test_analytics.py` -> previous 21 plus 9 new = expect `30/30 passed`.
+2. `cd frontend && npx tsc --noEmit; cd ..` -> no output.
+3. Without the packages/model installed: backend starts; Test Fall dialog shows "Voice unavailable — use the
+   buttons"; everything else works as before.
+4. `backend/.venv/Scripts/pip install -r backend/requirements.txt`, then
+   `backend/.venv/Scripts/python backend/scripts/download_models.py --stt`, then
+   `backend/.venv/Scripts/python backend/scripts/stt_smoke.py` at the patient's distance; record the hit rate here.
+5. Live: listening starts only after the prompt ends; "I am okay" cancels, "help" alarms at once, bare "okay" and
+   silence let the countdown run; 20 silent Test Fall runs with no false cancel; re-check after 2 min down;
+   compare the Plan 01 `timings` and `fps` idle vs. while listening (no degradation).
+
+### Voice switched from Sherpa-ONNX to Groq Whisper (2026-11-16) — implemented, NOT yet run
+
+Why: the local streaming model kept mishearing short words ("okay" -> ODY / WICKED / OCHING, "fine" -> KIND / FIVE,
+"help" -> HELL) even after gain, endpointing and phonetic-tolerance tuning. User decision: use Groq's `whisper-large-v3`.
+**Privacy change:** audio of the speech segment recorded while the fall dialog is open now leaves the machine (HTTPS to
+`api.groq.com`). Nothing is recorded outside a fall check, silence/noise is not sent, nothing is written to disk
+(the WAV is built in memory), and the key is never logged.
+
+- New in `backend/app/voice/`: `groq_stt.py` (key from `GROQ_API_KEY` env or `backend/.env`, read on every start;
+  POST to `/openai/v1/audio/transcriptions`, model `whisper-large-v3`, `language=en`, `temperature=0`, `verbose_json`;
+  segments Whisper doubts (`no_speech_prob > 0.6` and `avg_logprob < -1`) are dropped; **no `prompt`**, because a prompt
+  like "I am okay" can be echoed back on near-silent audio and would cancel a real emergency; every failure becomes
+  `SttError`), `recorder.py` (microphone via sounddevice, energy-based `Segmenter`: speech starts after 0.2 s voiced,
+  ends after 0.8 s silence, 5 s cap, 0.15 s countdown beeps ignored, threshold `VOICE_MIN_RMS` default 0.012; 16 kHz
+  mono WAV, peak-normalised up to 8x), `listener.py` (one daemon thread per fall check, max 4 transcriptions per check;
+  status idle / listening / transcribing / unavailable). `intent.py` is unchanged in behaviour (`classify`), minus the
+  streaming-only `urgent` helper.
+- No key or any network/API error -> status "unavailable" -> the dialog shows "Voice unavailable — use the buttons";
+  the buttons, countdown, alarm and re-check are unaffected. The dialog also shows "Processing…" while Groq works and
+  hints "say I am fine or help" while listening. The "listen only after the prompt ends" rule is kept.
+- Removed: `sherpa-onnx` from `requirements.txt` (added `requests==2.34.2`; `sounddevice==0.5.6` stays),
+  the `--stt` model download in `download_models.py`, gain / endpointing / partial-trigger code. `stt_process.py` is
+  now an empty stub (no delete tool was available): **delete it**, and the downloaded model and package:
+  `rm backend/app/voice/stt_process.py`, `rm -rf backend/models/sherpa-onnx-streaming-zipformer-en-2023-06-26`,
+  `backend/.venv/Scripts/pip uninstall -y sherpa-onnx sherpa-onnx-core`.
+- Secrets: `.gitignore` now ignores `.env` / `.env.*` (it did not before) except `backend/.env.example`. The key is
+  only in `backend/.env`. It was pasted into a chat message, so consider rotating it in the Groq console.
+- Tests: Sherpa-only tests removed (model files, finishing, gain/settings); added Groq request/response with a mocked
+  `post`, hallucination filter, failures-without-leaking-the-key, key from env then `.env`, listener acting on text,
+  no-key behaviour, segmenter (utterance, beeps/quiet, cap), WAV format, audio -> mocked Whisper -> action.
+  44 tests expected.
+- Untested assumptions: the Groq request format and rate limits (no network access from the assistant session);
+  the speech-detection threshold on this laptop's microphone (calibrate with `stt_smoke.py`, which prints the ambient
+  level, loudest frame and threshold); sounddevice recording from the Realtek device at its default rate.
+- To verify, in order: `backend/.venv/Scripts/python tests/test_analytics.py` (44/44); `cd frontend && npx tsc --noEmit`;
+  `backend/.venv/Scripts/python backend/scripts/stt_smoke.py` in a normal terminal (say "I am fine", "help", "I am not
+  okay"; check each is transcribed and classified, and that silence and the beeps send nothing); then the live dialog
+  (Test Fall -> speak after the prompt). Plan 02's Sherpa sections are obsolete (banner added to the plan file).
+
+### Short-word "help" with Groq Whisper (2026-11-16) — implemented, NOT yet run
+
+Observed: phrases ("I am okay", "I am not okay") work through Groq, but a single quick "help" is sometimes missed or
+mapped wrongly. Two separate causes, two fixes:
+- `intent.py` (parse step): "help" is now matched loosely: any word containing "elp" (help, helping, helpi, aelp, yelp)
+  or one letter from "help" (halp, hep, hell, held); "hello" / "hey" / "hold" do not match. Added Urdu/Hindi bachao
+  (+ spellings) and madad. The function is still `classify`; `parse_intent` is now an alias (the name the notes use).
+  Side effects: "helpful" / "Delphi" also count (false alarms are the accepted direction).
+- `recorder.py` (hearing step): `MIN_ON_S` 0.2 -> 0.12 s, `MIN_RMS` 0.012 -> 0.008, `PRE_S` 0.3 -> 0.4 s (soft "h").
+  Because a 0.15 s countdown beep is as long as a quick "help", duration alone cannot separate them (and beeps would
+  be uploaded and use up the per-check cap), so frames that are pure tones (`tonal_share` > `TONE_SHARE` 0.65: >65 %
+  of the frame's energy in one 150 Hz band) count as silence and do not raise the ambient estimate. `MAX_CALLS` 4 -> 8.
+  Env knobs: `VOICE_MIN_RMS`, `VOICE_TONE_SHARE` (documented in `backend/.env.example`).
+- `stt_smoke.py`: new `--classify TEXT...` (offline mapping check), `--beeps` (plays the dialog's tick every second
+  while listening), and it now prints ambient level, threshold, tone frames ignored, and short sounds that were NOT sent.
+- Tests added: loose help matching, tonal_share, a quick single word is kept, beeps ignored without hiding the next
+  word (48 tests expected).
+- UNVERIFIED: tone threshold 0.65 and the beep rejection are based on spectral arithmetic (square wave ~0.8, speech
+  <= ~0.6), not measurements through this laptop's speakers and microphone; run `stt_smoke.py --beeps` to check.
+
+### Faster hand-off to Groq (2026-11-16) — implemented, NOT yet run
+
+Observed: recognition works (check-in phrases and "help") but the utterance waited too long before being sent.
+- `recorder.py`: `TRAIL_S` 0.8 -> 0.5 s (silence that ends an utterance; `VOICE_TRAIL_S` overrides, also a
+  `trail_s` argument on `Segmenter`). Speech sensitivity is unchanged on purpose: `MIN_RMS` 0.008, `MIN_ON_S` 0.12,
+  `PRE_S` 0.4 s (no clipping of a soft first sound).
+- Cost of a shorter pause: slow speech is cut at its pauses more often ("I am" / "fine"). `listener.handle()` now
+  joins a piece that was not an answer with the next piece heard within `CARRY_S` = 4 s, so "I am" + "fine" -> ok;
+  a distress word still acts at once, a bare word still never counts, blank text changes nothing.
+- `stt_smoke.py` prints, per utterance, "about X s after you stopped speaking: 0.5 s silence + encode ms + Groq s",
+  and an average / slowest at the end.
+- Not done (possible next step if the measured Groq time dominates): reuse one HTTPS connection / warm it at the start
+  of the check; each request currently opens a new connection.
+- Tests: trailing-silence timing, joined sentences; two existing duration bounds adjusted (50 tests expected).
+
+### Very short words and a bug in the settings (2026-11-16) — implemented, NOT yet run
+
+Observed: smoke test listed 0.04-0.08 s sounds as "too short to count as speech". Cause: the minimum speech length
+(`MIN_ON_S`, 0.12 s since the "help" round), not the silence timeout. A quick "help" has only ~40-80 ms above the
+threshold on this laptop microphone.
+- `recorder.py`: `MIN_ON_S` 0.12 -> 0.06 s (3 frames of 20 ms; rounded up to whole frames, so "0.05" also means 0.06),
+  `TRAIL_S` 0.5 -> 0.4 s. New env `VOICE_MIN_ON_S` and `Segmenter(min_on_s=...)`. Cost: a click or tap of 60 ms or
+  more is now sent (Whisper returns nothing for it; capped at 8 sends per check). A 2-frame (40 ms) sound is still
+  ignored by default; `VOICE_MIN_ON_S=0.04` lets that through too.
+- BUG fixed: only `GROQ_API_KEY` was ever read from `backend/.env`; `VOICE_TRAIL_S`, `VOICE_MIN_RMS`,
+  `VOICE_TONE_SHARE` and `STT_INPUT_DEVICE` were read from the process environment only, so putting them in `.env`
+  (as `.env.example` says) did nothing. New `backend/app/voice/settings.py` reads environment first, then `.env`, on
+  every use; `groq_stt.api_key` and the recorder use it.
+- `stt_smoke.py` prints the effective `speech starts after` value and, under the list of ignored short sounds, which
+  setting to change.
+- Tests: silence timing now explicit per setting, very short word vs click, settings from env then `.env` (tests ignore
+  the developer's real `.env`): 52 tests expected.
+
+### "Listening…" shown but no audio captured (2026-11-16) — implemented, NOT yet run
+
+Report: the dialog says "Listening…" but nothing is captured or sent; no console errors. The report assumed a browser
+recorder (getUserMedia / MediaRecorder / WebSocket audio). **There is none**: the frontend never touches the microphone;
+the backend machine's microphone is captured by `sounddevice` in `listener.py`. The dialog only shows the status the
+backend reports, and the backend used to report "listening" the instant the check started, before the microphone was
+opened or any audio had arrived, so the label proved nothing.
+- `listener.py`: status is now "starting" until the first audio block arrives, then "listening". Watchdog
+  (`WATCHDOG_S` = 3 s): if the stream delivers no audio, or only digital silence (loudest sample < 1e-4, e.g. a muted
+  or virtual microphone such as DroidCam Audio), the status becomes "unavailable" with the reason in `error`, which the
+  dialog shows (tooltip) and telemetry carries. Trace log lines `voice: ...` (backend terminal): session started,
+  input device [index] name, microphone open at N Hz + threshold, first audio block, speech of X s found -> sending N
+  bytes, Groq answered in X s: text -> intent, session stopped, send limit.
+- `recorder.py` logs the chosen input device; `/api/fall/listen` returns `{ok, status, error}`.
+- Frontend (temporary `[voice] DEBUG` console logs in `FallCheck.tsx`): prompt finished -> request to open the
+  microphone -> backend answer -> each change of the backend's voice status / transcript. Search the console for
+  `[voice]`. The dialog shows "Starting microphone…" while "starting".
+- Most likely real cause on this machine: the Windows default input is "Microphone (DroidCam Audio)", which is silent.
+  `STT_INPUT_DEVICE` was only ever set in one PowerShell window; it can now live in `backend/.env`
+  (`STT_INPUT_DEVICE=Realtek`), which persists. Also: restart the backend after code changes.
+- Tests: fake microphone that delivers nothing, and one that delivers digital silence (53 tests expected).
+
+### Binding the KORP THALLIUM headset (2026-11-16) — implemented, NOT yet run
+
+Report: "Voice unavailable"; the headset "KORP THALLIUM" (device 3) is not locked onto. Findings: `backend/.env` had no
+`STT_INPUT_DEVICE`, so the backend used the Windows default input (DroidCam Audio, silent). And my silence watchdog
+(previous round) treated digital silence as a dead microphone; many headsets send exact zeros until you speak, so a
+working headset could be failed as "unavailable" during the quiet seconds after the prompt.
+- `recorder.py`: `STT_INPUT_DEVICE` is now a list (`device_preferences()` / `parse_device_list`): a number, or part of a
+  name (case, spaces and punctuation ignored: "korp thallium", "Korp-Thallium", "2- korp" all match "Microphone (2- KORP
+  THALLIUM)"), or several choices separated by commas / semicolons, tried in order; quotes are ignored.
+  `resolve_device`: a number must be an existing input; text matches an exact name first, then loosely, in the default
+  audio API first and then the others (one microphone is listed once per API); a failure lists the input devices.
+  `pick_device` skips choices that do not exist (headset unplugged -> next choice). `open_stream` tries the device's
+  rate, then 48000 / 44100 / 16000, mono then stereo, and raises the real PortAudio error; it yields
+  `(blocks, rate, device name)`. `describe_inputs` prints `[index] name (audio API, channels, rate)` with the default marked.
+- `listener.py`: digital silence for 3 s no longer fails the session. Status stays "listening", `warning` is set
+  ("No sound from <device> yet ... probably the wrong input device") and shown in the dialog (amber), cleared as soon as
+  sound appears; the log lists the input devices. Still a failure ("unavailable"): the stream delivers no audio blocks at
+  all, the device cannot be found or opened. Every failure logs the input device list.
+- `backend/.env`: added `STT_INPUT_DEVICE=KORP THALLIUM` (you can add a fallback: `KORP THALLIUM, Realtek`).
+  `stt_smoke.py` shows the chosen device and, when it cannot open one, the list.
+- Tests: list parsing, KORP matching in every spelling, fall-through of choices, rate fallback / real error, a silent
+  device warns and keeps listening (57 tests expected).
+
 ### Next: P2 persistence and upload mode
 
 SQLite + JSON report, recording mode A/B, H.264 recorder via imageio-ffmpeg, upload job worker process, session history with Recharts.

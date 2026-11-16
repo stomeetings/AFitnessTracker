@@ -115,6 +115,21 @@ export default function App() {
   const fallAlert = fall !== "NORMAL";
   const alert = t?.fall?.alert;
 
+  // Privacy mode: the preference lives here (saved in the browser), the backend applies it. Re-sent whenever the
+  // backend disagrees (after a change, a backend restart or a reconnect), not on every telemetry tick.
+  const [privacyPref, setPrivacyPref] = useState(() => { try { return localStorage.getItem("privacy") === "1"; } catch { return false; } });
+  const togglePrivacy = () => {
+    const v = !privacyPref;
+    setPrivacyPref(v);
+    try { localStorage.setItem("privacy", v ? "1" : "0"); } catch { /* storage blocked: session-only */ }
+  };
+  const backendPrivacy = t?.privacy;
+  useEffect(() => {
+    if (backendPrivacy !== undefined && backendPrivacy !== privacyPref) post("/api/config", { privacy: privacyPref });
+  }, [backendPrivacy, privacyPref, online]);   // `online` re-checks after a reconnect
+  // Never show video the backend has not confirmed is blanked (covers page load and backend restarts).
+  const hideVideo = privacyPref && !(online && t?.privacy);
+
   return (
     <div className="min-h-screen p-6">
       {fallAlert && (
@@ -128,9 +143,17 @@ export default function App() {
       <header className="mb-6 flex items-center gap-3">
         <Activity className="text-emerald-400" />
         <h1 className="text-xl font-semibold">AI Rehab Tracker</h1>
+        <button role="switch" aria-checked={privacyPref} onClick={togglePrivacy}
+          title="Privacy mode: hide the camera image and stream only the skeleton on a black background"
+          className="ml-auto flex items-center gap-2 rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300 hover:bg-slate-800">
+          Privacy
+          <span className={`relative h-4 w-7 rounded-full transition-colors ${privacyPref ? "bg-emerald-500" : "bg-slate-700"}`}>
+            <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${privacyPref ? "left-3.5" : "left-0.5"}`} />
+          </span>
+        </button>
         {/* TEMP: remove with POST /api/fall/test once the fall dialog has been tested */}
         <button onClick={() => post("/api/fall/test")} title="Simulate a fall to test the Are-you-okay dialog (temporary)"
-          className="ml-auto rounded-full border border-amber-600 px-3 py-1 text-xs text-amber-300 hover:bg-amber-500/10">
+          className="rounded-full border border-amber-600 px-3 py-1 text-xs text-amber-300 hover:bg-amber-500/10">
           Test Fall
         </button>
         <span className="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">P1 · single patient</span>
@@ -138,7 +161,7 @@ export default function App() {
 
       <main className="grid gap-6 lg:grid-cols-[1fr_360px]">
         <section className={`relative overflow-hidden rounded-2xl border bg-black ${fall === "CONFIRMED" ? "border-red-500" : "border-slate-800"}`}>
-          <img src="/api/video_feed" alt="live feed" className="block aspect-[4/3] w-full object-contain" />
+          <img src="/api/video_feed" alt="live feed" className={`block aspect-[4/3] w-full object-contain ${hideVideo ? "invisible" : ""}`} />
           <div className="absolute left-3 top-3 flex items-center gap-2 rounded-full bg-slate-900/80 px-3 py-1 text-xs backdrop-blur">
             <span className={`h-2 w-2 rounded-full ${online ? "bg-emerald-400" : "bg-red-500"}`} />
             {online ? (t?.pose_visible ? `LIVE · ${t?.posture ?? "pose"}` : "LIVE · no pose") : "OFFLINE"}
@@ -192,6 +215,11 @@ export default function App() {
             <Card icon={<Gauge size={14} />} label="FPS" value={t?.fps ?? "–"} />
             <Card icon={<Timer size={14} />} label="Latency" value={t ? `${t.latency_ms} ms` : "–"} />
           </div>
+          {t?.timings && (
+            <div className="text-[10px] tabular-nums text-slate-500" title="Smoothed time per stage. Capture is mostly waiting for the camera.">
+              capture {t.timings.capture_ms.toFixed(1)} · infer {t.timings.infer_ms.toFixed(1)} · pipeline {t.timings.pipeline_ms.toFixed(1)} · draw {t.timings.draw_ms.toFixed(1)} · encode {t.timings.encode_ms.toFixed(1)} ms
+            </div>
+          )}
 
           {t?.error && (
             <div className="flex items-center gap-2 rounded-xl border border-red-900 bg-red-950/50 p-3 text-sm text-red-300">
@@ -201,7 +229,7 @@ export default function App() {
         </aside>
       </main>
       {guideOpen && guide && t && <ExerciseGuide info={guideInfo} initial={t.exercise} onClose={() => setGuideOpen(false)} />}
-      {alert && (alert.state === "COUNTDOWN" || alert.state === "ALERTED") && <FallCheck alert={alert} />}
+      {alert && (alert.state === "COUNTDOWN" || alert.state === "ALERTED") && <FallCheck alert={alert} voice={t?.fall?.voice} />}
     </div>
   );
 }

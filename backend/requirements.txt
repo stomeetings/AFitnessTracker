@@ -15,3 +15,6 @@ python-multipart==0.0.33
 websockets==17.4
 imageio-ffmpeg==0.8.1
 pygrabber==0.2
+# Voice check-in: microphone capture + Groq Whisper over HTTPS (GROQ_API_KEY in backend/.env)
+sounddevice==0.5.6
+requests==2.34.2

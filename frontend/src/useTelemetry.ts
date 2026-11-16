@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
 
 export type Limb = { reps: number; state: string; angle: number | null; last_rom: number; best_rom: number };
-export type FallAlert = { state: "IDLE" | "COUNTDOWN" | "ALERTED" | "ACKNOWLEDGED"; seconds_left: number; impact: boolean };
+export type FallAlert = { state: "IDLE" | "COUNTDOWN" | "ALERTED" | "ACKNOWLEDGED"; seconds_left: number; impact: boolean; rechecks?: number };
+export type VoiceState = {
+  status: "off" | "unavailable" | "idle" | "starting" | "listening" | "transcribing";
+  transcript: string;
+  intent: string | null;
+  error?: string | null;
+  warning?: string | null;     // listening, but only digital silence so far (a gated headset, or the wrong input device)
+};
 export type Telemetry = {
   camera_index: number;
   camera_backend: string | null;
@@ -10,13 +17,15 @@ export type Telemetry = {
   device: string;
   fps: number;
   latency_ms: number;
+  timings?: { capture_ms: number; infer_ms: number; pipeline_ms: number; draw_ms: number; encode_ms: number };
+  privacy?: boolean;     // true only once the backend is actually streaming blanked frames
   pose_visible: boolean;
   error: string | null;
   exercise: string;
   angles?: Record<string, number>;
   reps?: Record<string, Limb>;
   mobility?: { state: string; steps: number; cadence_spm: number };
-  fall?: { status: "NORMAL" | "SUSPECTED" | "CONFIRMED"; tilt_deg: number | null; drop_velocity: number; aspect_ratio: number | null; seconds_in_state: number | null; alert?: FallAlert };
+  fall?: { status: "NORMAL" | "SUSPECTED" | "CONFIRMED"; tilt_deg: number | null; drop_velocity: number; aspect_ratio: number | null; seconds_in_state: number | null; alert?: FallAlert; voice?: VoiceState };
   posture?: string;
 };
 

@@ -1,5 +1,11 @@
 # Plan 02 — Offline voice check-in (Sherpa-ONNX) and acknowledgement re-check
 
+> **PARTLY SUPERSEDED (2026-11-16):** speech recognition is no longer Sherpa-ONNX. It was replaced by Groq's hosted
+> Whisper (a cloud service, so no longer offline); see `backend/app/voice/groq_stt.py`, `recorder.py`, `listener.py`
+> and the activity log. The Sherpa parts (sections 2, 3, 4.2, 4.3 and the model/process details elsewhere) are
+> obsolete. Still valid: the intent rules (4.1), `escalate()` and the 2-minute re-check (4.4), the endpoints and the
+> dialog changes (4.5, 5), and the acceptance checks that do not mention Sherpa.
+
 Self-contained implementation plan. Read this whole file before editing anything.
 Prerequisite: Plan 01 is implemented, because its `timings` telemetry is used here to prove nothing got slower.
 

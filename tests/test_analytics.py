@@ -15,6 +15,18 @@ from app.pipeline.escalation import ACKNOWLEDGED, ALERTED, COUNTDOWN, IDLE  # no
 from app.pipeline.fall_detector import CONFIRMED, NORMAL, SUSPECTED, FallDetector  # noqa: E402
 from app.pipeline.kinematics import EMA, angle_deg, joint_angles  # noqa: E402
 from app.pipeline.rep_counter import RepCounter  # noqa: E402
+from app.voice.intent import classify, parse_intent  # noqa: E402
+import os  # noqa: E402
+
+from app.voice import groq_stt, recorder, settings  # noqa: E402
+
+# The voice tests must not depend on the developer's own backend/.env or environment variables.
+settings.ENV_FILE = Path(__file__).with_name("no-such-settings.env")
+for _name in ("VOICE_MIN_RMS", "VOICE_TONE_SHARE", "VOICE_TRAIL_S", "VOICE_MIN_ON_S", "STT_INPUT_DEVICE"):
+    os.environ.pop(_name, None)
+from app.voice.listener import VoiceListener  # noqa: E402
+from app.voice.recorder import (  # noqa: E402
+    Segmenter, describe_inputs, parse_device_list, pick_device, resolve_device, to_wav_bytes, tonal_share)
 
 FPS = 30
 
@@ -389,6 +401,618 @@ def test_escalation_slow_descent_also_escalates():
     assert alert["seconds_left"] > 5.5, alert                       # 10 s countdown, ~1.5 s already gone
     t, alert, seen, fired = _hold(p, t, LYING, 9.5)
     assert alert["state"] == ALERTED and fired == 1, (alert, fired)
+
+
+def test_intent_classification():
+    help_ = ["help", "HELP ME", "I need help", "call an ambulance", "I am not okay", "I'm not ok", "no",
+             "I can't get up", "it hurts", "no I am fine"]        # the last is mixed: escalating is the safe side
+    ok = ["I am okay", "I'M OKAY", "yes I am fine", "im alright", "i am all right", "I’m fine"]
+    none = ["okay", "yes", "fine", "", "   ", "the weather is nice", "um"]
+    for s in help_:
+        assert classify(s) == "help", s
+    for s in ok:
+        assert classify(s) == "ok", s
+    for s in none:
+        assert classify(s) is None, s
+    # Documents a known risk: the dialog's own spoken prompt contains "I'm OK" and would count as an answer.
+    # The parser cannot tell, so the defence is the browser opening the microphone only AFTER the prompt ends.
+    assert classify("Are you okay? Press I'm OK, or stand up.") == "ok"
+
+
+class _FakeResponse:
+    def __init__(self, status=200, body=None):
+        self.status_code, self._body = status, ({} if body is None else body)
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+def _fake_post(response, calls=None):
+    """Stands in for requests.post: records the request, then returns (or raises) `response`."""
+    def post(url, **kwargs):
+        if calls is not None:
+            calls.append((url, kwargs))
+        if isinstance(response, Exception):
+            raise response
+        return response
+    return post
+
+
+def test_groq_transcribe_sends_the_expected_request_and_returns_the_text():
+    calls = []
+    body = {"text": " I am fine.", "segments": [{"text": " I am fine.", "no_speech_prob": 0.01, "avg_logprob": -0.2}]}
+    assert groq_stt.transcribe(b"RIFFwav", "test-key", post=_fake_post(_FakeResponse(200, body), calls)) == "I am fine."
+    url, kw = calls[0]
+    assert url == "https://api.groq.com/openai/v1/audio/transcriptions"
+    assert kw["headers"] == {"Authorization": "Bearer test-key"}
+    assert kw["data"]["model"] == "whisper-large-v3" and kw["data"]["language"] == "en"
+    assert kw["files"]["file"] == ("speech.wav", b"RIFFwav", "audio/wav")
+    assert "prompt" not in kw["data"]       # a prompt such as "I am okay" could be echoed back on near-silent audio
+    assert groq_stt.transcribe(b"x", "k", post=_fake_post(_FakeResponse(200, {"text": " help "}))) == "help"
+
+
+def test_groq_drops_segments_whisper_doubts():
+    junk = {"text": " Thank you.", "no_speech_prob": 0.9, "avg_logprob": -1.4}      # typical invention on silence
+    real = {"text": " I am okay", "no_speech_prob": 0.02, "avg_logprob": -0.3}
+    assert groq_stt.transcribe(b"x", "k", post=_fake_post(_FakeResponse(200, {"segments": [junk, real]}))) == "I am okay"
+    assert groq_stt.transcribe(b"x", "k", post=_fake_post(_FakeResponse(200, {"segments": [junk]}))) == ""
+
+
+def test_groq_failures_become_stt_error_and_never_leak_the_key():
+    key = "SECRET-KEY-123"
+    cases = ((_FakeResponse(401), "rejected"), (_FakeResponse(403), "rejected"), (_FakeResponse(429), "rate limit"),
+             (_FakeResponse(500), "HTTP 500"), (_FakeResponse(200, ValueError("not json")), "unreadable"),
+             (ConnectionError("no route to host"), "network"), (TimeoutError("slow"), "network"))
+    for response, expected in cases:
+        try:
+            groq_stt.transcribe(b"x", key, post=_fake_post(response))
+        except groq_stt.SttError as e:
+            assert expected in str(e) and key not in str(e), (expected, str(e))
+        else:
+            raise AssertionError(f"{expected}: must raise SttError")
+
+
+def test_api_key_from_env_then_dotenv():
+    import os
+    import tempfile
+    saved = os.environ.pop("GROQ_API_KEY", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / ".env"
+            assert groq_stt.api_key(env) is None                        # no variable, no file
+            env.write_text("# comment\nGROQ_API_KEY=key_from_file\nOTHER=1\n")
+            assert groq_stt.api_key(env) == "key_from_file"
+            os.environ["GROQ_API_KEY"] = "key_from_env"
+            assert groq_stt.api_key(env) == "key_from_env"              # the environment wins
+            os.environ["GROQ_API_KEY"] = "   "
+            assert groq_stt.api_key(env) == "key_from_file"             # blank counts as unset
+    finally:
+        os.environ.pop("GROQ_API_KEY", None)
+        if saved is not None:
+            os.environ["GROQ_API_KEY"] = saved
+
+
+def test_intent_accepts_sentences_cut_by_endpointing():
+    # The recogniser sometimes ends a sentence early, so the leading "I" can be missing: "I" / "AM FINE".
+    for s in ("am fine", "am okay", "AM FINE", "am alright", "i'm ok", "I'm fine", "all good", "doing fine",
+              "doing okay", "I am all good", "yes I am fine"):
+        assert classify(s) == "ok", s
+    # A single word, or half a sentence, must never cancel the countdown.
+    for s in ("okay", "ok", "OKAY", "yes", "fine", "good", "alright", "all", "I", "AM", "I AM", "I AM LOOKING", "I AM WICKED"):
+        assert classify(s) is None, s
+    # Any negative or help word wins, even next to an affirmative.
+    for s in ("not", "I don't feel good", "it isn't fine", "I can't get up", "no", "pain", "am not fine",
+              "I am fine but it hurts", "am fine no", "I am not okay", "help I am fine"):
+        assert classify(s) == "help", s
+
+
+def test_voice_listener_acts_on_transcribed_text():
+    acted = []
+    v = VoiceListener(on_ok=lambda: acted.append("ok"), on_help=lambda: acted.append("help"))
+    for text, intent in (("I am fine.", "ok"), ("Help!", "help"), ("No, I am fine.", "help"), ("Okay.", None),
+                         ("Thank you.", None), ("", None), ("I am okay", "ok"), ("I'm not okay.", "help")):
+        acted.clear()
+        assert v.handle(text) == intent, text
+        assert v.transcript == text and v.intent == intent
+        assert acted == ([intent] if intent else []), (text, acted)
+
+
+def test_voice_listener_joins_a_sentence_cut_by_a_pause():
+    acted = []
+    v = VoiceListener(on_ok=lambda: acted.append("ok"), on_help=lambda: acted.append("help"))
+    assert v.handle("I am", now=0.0) is None and acted == []
+    assert v.handle("fine.", now=1.5) == "ok" and acted == ["ok"]            # one sentence, cut at the pause
+    acted.clear()
+    assert v.handle("I am", now=10.0) is None
+    assert v.handle("fine.", now=20.0) is None and acted == []               # too long ago: not the same sentence
+    assert v.handle("fine.", now=20.5) is None                               # a bare word still never counts
+    assert v.handle("I am okay", now=21.0) == "ok"
+    assert v.handle("   ", now=30.0) is None and v.transcript == "   "       # silence changes nothing
+    v2 = VoiceListener(on_ok=lambda: acted.append("ok"), on_help=lambda: acted.append("help"))
+    assert v2.handle("it hurts", now=0.0) == "help" and acted[-1] == "help"  # a distress word still acts at once
+
+
+_FAKE_DEVICES = [       # this machine's input devices as sounddevice lists them (default input: the silent DroidCam one)
+    {"name": "Microsoft Sound Mapper - Input", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 44100.0},
+    {"name": "Microphone (DroidCam Audio)", "hostapi": 0, "max_input_channels": 1, "default_samplerate": 44100.0},
+    {"name": "Microphone (Realtek Audio)", "hostapi": 0, "max_input_channels": 2, "default_samplerate": 44100.0},
+    {"name": "Microphone (2- KORP THALLIUM)", "hostapi": 0, "max_input_channels": 1, "default_samplerate": 44100.0},
+    {"name": "Speakers (Realtek Audio)", "hostapi": 0, "max_input_channels": 0, "default_samplerate": 44100.0},
+    {"name": "Microphone (2- KORP THALLIUM)", "hostapi": 1, "max_input_channels": 1, "default_samplerate": 48000.0},
+    {"name": "WASAPI Only Mic", "hostapi": 1, "max_input_channels": 1, "default_samplerate": 48000.0},
+]
+
+
+def _fake_sounddevice(default=1, InputStream=None):
+    """A stand-in for the sounddevice module with the device list above."""
+    import types
+
+    def query_devices(device=None, kind=None):
+        if isinstance(device, int):
+            return dict(_FAKE_DEVICES[device], index=device)
+        if device is None and kind is None:
+            return [dict(d, index=i) for i, d in enumerate(_FAKE_DEVICES)]
+        return dict(_FAKE_DEVICES[default], index=default)               # kind="input": the system default
+
+    return types.SimpleNamespace(query_devices=query_devices, query_hostapis=lambda i: {"name": ["MME", "WASAPI"][i]},
+                                 InputStream=InputStream)
+
+
+def test_parse_device_list():
+    assert parse_device_list("3") == [3] and parse_device_list(" 3 ") == [3]
+    assert parse_device_list("KORP THALLIUM") == ["KORP THALLIUM"]
+    assert parse_device_list('"KORP THALLIUM"') == ["KORP THALLIUM"]                  # quotes are ignored
+    assert parse_device_list("KORP THALLIUM, 2 ; Realtek") == ["KORP THALLIUM", 2, "Realtek"]
+    assert parse_device_list("") == [] and parse_device_list(None) == [] and parse_device_list(" , ; ") == []
+
+
+def test_resolve_device_binds_the_korp_thallium_headset_however_it_is_written():
+    sd = _fake_sounddevice()
+    for written in (3, "KORP THALLIUM", "korp thallium", "KORPTHALLIUM", "Korp-Thallium", "2- korp",
+                    "Microphone (2- KORP THALLIUM)"):
+        assert resolve_device(sd, written) == 3, written      # never its copy under the other audio API (index 5)
+    assert resolve_device(sd, "wasapi only") == 6             # only in another audio API: found there
+    for bad in (4, 99, "Speakers", "no such headset"):        # an output-only device, a missing index, unknown names
+        try:
+            resolve_device(sd, bad)
+        except ValueError as e:
+            assert "[3] Microphone (2- KORP THALLIUM)" in str(e) and "--devices" in str(e), (bad, str(e))
+        else:
+            raise AssertionError(f"{bad!r} must not resolve")
+
+
+def test_pick_device_falls_back_down_the_list_and_describes_the_devices():
+    sd = _fake_sounddevice()
+    assert pick_device(sd, []) == (None, "Microphone (DroidCam Audio)")             # nothing set: the system default
+    assert pick_device(sd, ["KORP THALLIUM"]) == (3, "Microphone (2- KORP THALLIUM)")
+    assert pick_device(sd, ["Missing Headset", 3, "Realtek"]) == (3, "Microphone (2- KORP THALLIUM)")   # skip a missing one
+    try:
+        pick_device(sd, ["Missing Headset", 42])
+    except ValueError as e:
+        assert "none of the configured input devices" in str(e) and "[3] Microphone (2- KORP THALLIUM)" in str(e)
+    else:
+        raise AssertionError("nothing found must raise, listing the devices")
+    text = describe_inputs(sd)
+    assert "[1] Microphone (DroidCam Audio)" in text and "<- Windows default" in text
+    assert "Speakers" not in text and "WASAPI" in text                              # inputs only, with their audio API
+
+
+def test_open_stream_binds_the_headset_and_tries_other_sample_rates():
+    import numpy as np
+    opened = []
+
+    class PickyStream:
+        def __init__(self, **kwargs):
+            if kwargs["samplerate"] != 48000:
+                raise RuntimeError("Invalid sample rate [PaErrorCode -9997]")
+            opened.append(kwargs)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    with recorder.open_stream(_fake_sounddevice(InputStream=PickyStream), ["KORP THALLIUM"]) as (blocks, rate, name):
+        assert (rate, name) == (48000, "Microphone (2- KORP THALLIUM)")           # 44100 refused, 48000 accepted
+        assert opened[-1]["device"] == 3 and opened[-1]["channels"] == 1
+        opened[-1]["callback"](np.ones((4, 1), np.float32), 4, None, None)
+        assert blocks.get_nowait().tolist() == [1.0] * 4
+
+    class Refusing:
+        def __init__(self, **kwargs):
+            raise RuntimeError("Device unavailable")
+
+    try:
+        with recorder.open_stream(_fake_sounddevice(InputStream=Refusing), ["KORP THALLIUM"]):
+            pass
+    except RuntimeError as e:
+        assert "Device unavailable" in str(e)                                       # the real reason, not a vague one
+    else:
+        raise AssertionError("a device that cannot be opened must raise")
+
+
+def _run_voice_with_fake_microphone(deliver_silence):
+    """Runs VoiceListener.start() against a fake sounddevice: the stream opens, but it delivers either nothing at all or
+    digital silence (like a muted or virtual microphone). Returns (listener once it gave up, status right after start)."""
+    import sys
+    import threading
+    import time
+    import types
+    import numpy as np
+    from app.voice import listener as listener_mod
+
+    class FakeStream:
+        def __init__(self, callback=None, **kwargs):
+            self.callback, self.running = callback, False
+
+        def start(self):
+            self.running = True
+            if deliver_silence:
+                def pump():
+                    while self.running:
+                        self.callback(np.zeros((320, 1), np.float32), 320, None, None)
+                        time.sleep(0.02)
+                threading.Thread(target=pump, daemon=True).start()
+
+        def stop(self):
+            self.running = False
+
+        def close(self):
+            self.running = False
+
+    fake = _fake_sounddevice(InputStream=FakeStream)
+    saved = (sys.modules.get("sounddevice"), groq_stt.api_key, listener_mod.WATCHDOG_S)
+    sys.modules["sounddevice"] = fake
+    groq_stt.api_key = lambda *a, **k: "test-key"
+    listener_mod.WATCHDOG_S = 0.3
+    try:
+        v = VoiceListener(on_ok=lambda: None, on_help=lambda: None)
+        v.start()
+        first = v.status
+        deadline = time.time() + 5
+        while not v.warning and v.status in ("starting", "listening") and time.time() < deadline:
+            time.sleep(0.05)
+        return v, first
+    finally:
+        if saved[0] is None:
+            sys.modules.pop("sounddevice", None)
+        else:
+            sys.modules["sounddevice"] = saved[0]
+        groq_stt.api_key, listener_mod.WATCHDOG_S = saved[1], saved[2]
+
+
+def test_voice_gives_up_when_the_microphone_delivers_no_audio():
+    v, first = _run_voice_with_fake_microphone(deliver_silence=False)
+    assert first == "starting"                                  # never "listening" before any audio has arrived
+    assert v.status == "unavailable" and "no audio" in v.error, (v.status, v.error)
+
+
+def test_voice_keeps_listening_and_warns_when_the_microphone_is_silent():
+    v, _ = _run_voice_with_fake_microphone(deliver_silence=True)     # no STT_INPUT_DEVICE: the silent DroidCam default
+    try:
+        # a headset that is silent until you speak (noise gate) is NOT a failure: it warns and stays "listening"
+        assert v.status == "listening" and v.error is None, (v.status, v.error)
+        assert v.warning and "No sound" in v.warning and "DroidCam Audio" in v.warning, v.warning
+    finally:
+        v.stop()
+
+
+def test_voice_is_unavailable_without_a_key_and_starts_no_thread():
+    saved = groq_stt.api_key
+    groq_stt.api_key = lambda *a, **k: None
+    try:
+        v = VoiceListener(on_ok=lambda: None, on_help=lambda: None)
+        v.init()
+        assert v.status == "unavailable" and "GROQ_API_KEY" in v.error
+        v.start()                                              # the dialog asks for the microphone: still unavailable
+        assert v.status == "unavailable" and not v.active and v._thread is None
+        assert v.snapshot() == {"status": "unavailable", "transcript": "", "intent": None, "error": v.error,
+                                "warning": None}
+    finally:
+        groq_stt.api_key = saved
+
+
+def _noise(rng, seconds, rate=16000, amp=0.1):
+    import numpy as np
+    return rng.normal(0, amp, int(seconds * rate)).astype(np.float32)
+
+
+def _feed_all(seg, audio, block=800):
+    out = []
+    for i in range(0, len(audio), block):
+        u = seg.feed(audio[i:i + block])
+        if u is not None:
+            out.append(u)
+    return out
+
+
+def test_segmenter_returns_one_utterance_with_preroll_and_trailing_silence():
+    import numpy as np
+    rng = np.random.default_rng(1)
+    audio = np.concatenate([np.zeros(8000, np.float32), _noise(rng, 0.6), np.zeros(16000, np.float32)])
+    utterances = _feed_all(Segmenter(16000), audio)
+    assert len(utterances) == 1
+    assert 1.1 < len(utterances[0]) / 16000 < 1.6      # 0.4 s pre-roll + speech + 0.4 s of trailing silence
+
+
+def test_segmenter_ignores_beeps_and_quiet_noise():
+    import numpy as np
+    rng = np.random.default_rng(2)
+    t = np.arange(int(0.12 * 16000)) / 16000
+    beep = (0.3 * np.sin(2 * np.pi * 880 * t)).astype(np.float32)     # a countdown tick: 0.12 s, far shorter than speech
+    gap = np.zeros(16000, np.float32)
+    assert _feed_all(Segmenter(16000), np.concatenate([gap, beep, gap, beep, gap])) == []
+    assert _feed_all(Segmenter(16000), _noise(rng, 3.0, amp=0.003)) == []     # a quiet room is not speech
+
+
+def test_segmenter_caps_a_long_utterance():
+    import numpy as np
+    utterances = _feed_all(Segmenter(16000), _noise(np.random.default_rng(3), 7.0))
+    assert utterances and 4.9 < len(utterances[0]) / 16000 < 5.2
+
+
+def _voiced_like(seconds, rng, rate=16000, f0=200, rms=0.03):
+    """A rough stand-in for a vowel: harmonics of f0 with a speech-like tilt, plus breath noise."""
+    import numpy as np
+    t = np.arange(int(seconds * rate)) / rate
+    x = sum(np.sin(2 * np.pi * f0 * h * t) / np.sqrt(h) for h in range(1, 16)) + 0.2 * rng.normal(0, 1, len(t))
+    return (x * rms / x.std()).astype(np.float32)
+
+
+def test_tonal_share_separates_beeps_from_speechlike_sound():
+    import numpy as np
+    rng = np.random.default_rng(5)
+    beep = (0.3 * np.sin(2 * np.pi * 880 * np.arange(320) / 16000)).astype(np.float32)     # one 20 ms frame of a beep
+    assert tonal_share(beep) > 0.9
+    assert tonal_share(_voiced_like(0.02, rng)) < 0.6          # harmonics + breath noise: spread over many bins
+    assert tonal_share(_noise(rng, 0.02)) < 0.3                # a noise burst such as the "h" or "p" of "help"
+
+
+def test_segmenter_keeps_a_quick_single_word_like_help():
+    import numpy as np
+    rng = np.random.default_rng(6)
+    word = _voiced_like(0.14, rng, rms=0.02)                   # only ~0.14 s of voiced sound, as in a sharp "help"
+    audio = np.concatenate([np.zeros(8000, np.float32), word, np.zeros(19200, np.float32)])
+    utterances = _feed_all(Segmenter(16000), audio)
+    assert len(utterances) == 1
+    assert 0.7 < len(utterances[0]) / 16000 < 1.2
+
+
+def test_utterance_ends_after_the_configured_silence():
+    import numpy as np
+    rng = np.random.default_rng(8)
+    word = _voiced_like(0.2, rng, rms=0.03)
+    lead = np.zeros(8000, np.float32)
+
+    def after(silence_s, **settings_):
+        audio = np.concatenate([lead, word, np.zeros(int(silence_s * 16000), np.float32)])
+        return _feed_all(Segmenter(16000, **settings_), audio)
+
+    assert Segmenter(16000).trail_s == 0.4                      # the default: a one-word answer goes out after 0.4 s
+    assert after(0.3) == [] and len(after(0.5)) == 1            # not yet at 0.3 s of silence, done by 0.5 s
+    assert after(0.45, trail_s=0.5) == [] and len(after(0.6, trail_s=0.5)) == 1     # the setting is respected
+    assert len(after(0.35, trail_s=0.3)) == 1
+
+
+def test_segmenter_catches_a_very_short_word_but_not_a_click():
+    import numpy as np
+    rng = np.random.default_rng(9)
+    zeros = np.zeros(8000, np.float32)
+    assert Segmenter(16000).min_on_s == 0.06 and Segmenter(16000)._min_on == 3     # 3 frames of 20 ms
+    word = _voiced_like(0.08, rng, rms=0.03)                    # 4 frames: a clipped, sharp "help" or "OK"
+    assert len(_feed_all(Segmenter(16000), np.concatenate([zeros, word, np.zeros(16000, np.float32)]))) == 1
+    click = _voiced_like(0.04, rng, rms=0.03)                   # 2 frames: a tap or a click
+    seg = Segmenter(16000)
+    assert _feed_all(seg, np.concatenate([zeros, click, np.zeros(16000, np.float32)])) == []
+    assert seg.ignored and seg.ignored[-1]["s"] < 0.06          # remembered, so the smoke test can list it
+    assert len(_feed_all(Segmenter(16000, min_on_s=0.04), np.concatenate([zeros, click, np.zeros(16000, np.float32)]))) == 1
+
+
+def test_voice_settings_read_the_environment_then_dotenv():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        env = Path(tmp) / ".env"
+        env.write_text("VOICE_TRAIL_S=0.3\nSTT_INPUT_DEVICE=Realtek\nVOICE_MIN_RMS=oops\n")
+        assert settings.get_float("VOICE_TRAIL_S", 0.4, env) == 0.3          # from the file
+        assert settings.get("STT_INPUT_DEVICE", None, env) == "Realtek"
+        assert settings.get_float("VOICE_MIN_RMS", 0.008, env) == 0.008      # not a number: the default
+        assert settings.get_float("VOICE_TONE_SHARE", 0.65, env) == 0.65     # absent: the default
+        os.environ["VOICE_TRAIL_S"] = "0.35"
+        try:
+            assert settings.get_float("VOICE_TRAIL_S", 0.4, env) == 0.35     # the environment wins
+        finally:
+            os.environ.pop("VOICE_TRAIL_S", None)
+    os.environ["STT_INPUT_DEVICE"] = "3"
+    try:
+        assert recorder.device_preferences() == [3]
+        os.environ["STT_INPUT_DEVICE"] = "KORP THALLIUM, Realtek"
+        assert recorder.device_preferences() == ["KORP THALLIUM", "Realtek"]
+    finally:
+        os.environ.pop("STT_INPUT_DEVICE", None)
+    assert recorder.device_preferences() == []
+
+
+def test_beeps_are_ignored_and_do_not_hide_the_next_word():
+    import numpy as np
+    rng = np.random.default_rng(7)
+    t = np.arange(int(0.15 * 16000)) / 16000
+    beep = (0.3 * np.sign(np.sin(2 * np.pi * 880 * t))).astype(np.float32)     # the dialog's tick is a square wave
+    gap = np.zeros(8000, np.float32)
+    word = _voiced_like(0.25, rng, rms=0.03)
+    seg = Segmenter(16000)
+    # two ticks as long as a quick "help", then the word: only the word may come out, and the ticks must not raise
+    # the ambient estimate (which would hide the word)
+    utterances = _feed_all(seg, np.concatenate([gap, beep, gap, beep, np.zeros(4800, np.float32), word,
+                                                np.zeros(19200, np.float32)]))
+    assert len(utterances) == 1, (len(utterances), seg.tone_frames, seg.threshold)
+    assert seg.tone_frames >= 8
+
+
+def test_wav_is_16khz_mono_and_normalised():
+    import io
+    import wave
+    import numpy as np
+    rate = 48000
+
+    def encode(amplitude):
+        x = (amplitude * np.sin(2 * np.pi * 300 * np.arange(rate) / rate)).astype(np.float32)   # 1 s tone
+        with wave.open(io.BytesIO(to_wav_bytes(x, rate))) as w:
+            assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 16000)
+            assert abs(w.getnframes() - 16000) <= 2
+            return abs(np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)).max() / 32767
+
+    assert 0.6 < encode(0.15) < 0.75        # a quiet microphone is brought up to a clear level, without clipping
+    assert 0.3 < encode(0.05) < 0.45        # ... but by at most 8x
+
+
+def test_pipeline_from_speech_audio_to_action_with_mocked_whisper():
+    import numpy as np
+    rng = np.random.default_rng(4)
+    audio = np.concatenate([np.zeros(8000, np.float32), _noise(rng, 1.0), np.zeros(16000, np.float32)])
+    utterances = _feed_all(Segmenter(16000), audio)
+    assert len(utterances) == 1
+    wav = to_wav_bytes(utterances[0], 16000)
+    acted = []
+    v = VoiceListener(on_ok=lambda: acted.append("ok"), on_help=lambda: acted.append("help"))
+    text = groq_stt.transcribe(wav, "k", post=_fake_post(_FakeResponse(200, {"text": "I am okay."})))
+    assert v.handle(text) == "ok" and acted == ["ok"]
+    text = groq_stt.transcribe(wav, "k", post=_fake_post(_FakeResponse(200, {"text": "Help me, I fell."})))
+    assert v.handle(text) == "help" and acted == ["ok", "help"]
+
+
+def test_intent_matches_help_loosely():
+    for s in ("help", "Help!", "HELP ME", "helpi", "aelp", "elp", "halp", "yelp", "hep", "helps", "helping",
+              "help me please", "bachao", "Bachao!", "bhachao", "bacchao", "madad", "emergency", "hell", "held",
+              "um help um", "i need help now"):
+        assert classify(s) == "help", s
+    for s in ("hello", "hey", "he'll be fine", "hold", "yes", "okay", "the weather is nice", "um"):
+        assert classify(s) is None, s                          # near the word, but not close enough to count
+    assert classify("I am well") == "ok" and classify("I am fine") == "ok"      # the loose match leaves answers alone
+    assert parse_intent is classify                             # the name the plans use
+
+
+def test_intent_accepts_phonetic_near_misses_only_after_i_am():
+    for s in ("i am fine", "i'm fine", "am fine", "i am five", "i am kind", "i am oky", "i am okay", "i'm okay",
+              "am okay", "I AM OKEY", "I AM FIGHT", "I'M KIND", "AM FIVE", "i am well", "i am all good", "am alright"):
+        assert classify(s) == "ok", s
+    # the same words alone, or without "am", never count as an answer
+    for s in ("five", "kind", "fight", "well", "oky", "okey", "ok", "okay", "yes", "fine", "good", "kind of",
+              "I have five", "fine five", "i five"):
+        assert classify(s) is None, s
+    # every negative or distress word still wins, however affirmative the rest sounds
+    for s in ("no i am five", "help", "i am fine help", "i am not fine", "i am not kind", "i can't", "it hurts", "pain",
+              "i fell", "i had a fall", "i am stuck", "i feel dizzy", "i feel sick", "this is bad", "i have fallen",
+              "emergency", "i am fine but i fell"):
+        assert classify(s) == "help", s
+
+
+def test_intent_near_misses_seen_in_live_testing():
+    # a soft "help" comes out as "hell" or "held" on a laptop mic: still an emergency
+    for s in ("hell", "HELL", "held", "HELD", "what the hell", "no i am ok", "hell i am ok"):
+        assert classify(s) == "help", s
+    assert classify("hello") is None                           # a different word: not an emergency
+    for s in ("i am ok", "i'm ok", "am ok", "i am oky", "i am oke", "i am okey", "i am ache", "i'm ache", "AM ACHE"):
+        assert classify(s) == "ok", s
+    for s in ("ok", "okay", "oke", "ache", "i ache", "my back ache"):
+        assert classify(s) is None, s                          # a bare word, or no "am" in front, never counts
+
+
+def test_resolve_device_uses_default_audio_api_only():
+    class FakeSD:                                       # the shape of this machine's device list
+        def query_devices(self, device=None, kind=None):
+            if kind == "input":
+                return {"index": 1, "hostapi": 0, "name": "Microphone (DroidCam Audio)", "max_input_channels": 1}
+            return [
+                {"name": "Microsoft Sound Mapper - Input", "hostapi": 0, "max_input_channels": 2},
+                {"name": "Microphone (DroidCam Audio)", "hostapi": 0, "max_input_channels": 1},
+                {"name": "Microphone (Realtek Audio)", "hostapi": 0, "max_input_channels": 2},
+                {"name": "Microphone (Realtek Audio)", "hostapi": 1, "max_input_channels": 2},   # same mic, other API
+                {"name": "Speakers (Realtek Audio)", "hostapi": 0, "max_input_channels": 0},     # output only
+            ]
+    sd = FakeSD()
+    assert resolve_device(sd, None) is None             # keep the Windows default
+    assert resolve_device(sd, 3) == 3                   # a number is used as given
+    assert resolve_device(sd, "realtek") == 2           # not the speakers, not the other audio API's copy
+    assert resolve_device(sd, "DROIDCAM") == 1          # case-insensitive
+    try:
+        resolve_device(sd, "no such microphone")
+    except ValueError as e:
+        assert "--devices" in str(e)
+    else:
+        raise AssertionError("an unknown name must raise")
+
+
+FLOOR = _floor_pose()       # flat on the floor, all joints tracked: stays "down" however long the test runs
+
+
+def test_escalate_skips_the_countdown():
+    p = Pipeline("Knee Flexion")
+    t, alert, seen, fired = _hold(p, 0.0, FLOOR, 5.5)               # down for the 5 s dwell: countdown starts
+    assert alert["state"] == COUNTDOWN and alert["rechecks"] == 0, alert
+    p.escalation.escalate()                                         # voice "help" / Trigger Emergency button
+    t, alert, seen, fired = _hold(p, t, FLOOR, 0.2)
+    assert seen == [ALERTED] and fired == 1, (seen, fired)
+
+
+def test_escalate_while_idle_is_ignored_and_does_not_pre_arm():
+    p = Pipeline("Knee Flexion")
+    p.escalation.escalate()
+    t, alert, seen, fired = _hold(p, 0.0, STANDING, 0.5)
+    assert seen == [IDLE] and fired == 0, seen
+    t, alert, seen, fired = _hold(p, _fall(p, t), LYING, 5.5)       # a later real fall still gets its countdown
+    assert alert["state"] == COUNTDOWN and fired == 0, alert
+
+
+def test_recheck_when_still_down_after_acknowledge():
+    p = Pipeline("Knee Flexion")
+    t, alert, seen, fired = _hold(p, 0.0, FLOOR, 5.5)
+    assert alert["state"] == COUNTDOWN
+    p.escalation.ack()                                              # "I'm OK" (button or voice), but still on the floor
+    t, alert, seen, fired = _hold(p, t, FLOOR, 119.0)               # quiet for just under two minutes
+    assert seen == [ACKNOWLEDGED] and fired == 0 and alert["rechecks"] == 0, (seen, alert)
+    t, alert, seen, fired = _hold(p, t, FLOOR, 2.0)                 # two minutes since the answer: asked again
+    assert seen == [ACKNOWLEDGED, COUNTDOWN] and alert["rechecks"] == 1, (seen, alert)
+    assert 7 < alert["seconds_left"] <= 10, alert                   # a fresh 10 s countdown
+    t, alert, seen, fired = _hold(p, t, FLOOR, 10.5)                # unanswered again: the alarm
+    assert seen == [COUNTDOWN, ALERTED] and fired == 1, (seen, fired)
+
+
+def test_recheck_never_fires_if_the_person_got_up():
+    p = Pipeline("Knee Flexion")
+    t, alert, seen, fired = _hold(p, 0.0, FLOOR, 5.5)
+    p.escalation.ack()
+    t, alert, seen, fired = _hold(p, t, FLOOR, 30.0)
+    t, alert, seen, fired = _hold(p, t, STANDING, 2.0)              # stands up inside the two minutes
+    assert seen == [ACKNOWLEDGED, IDLE] and alert["rechecks"] == 0, (seen, alert)   # IDLE once upright 0.5 s
+    t, alert, seen, fired = _hold(p, t, STANDING, 130.0)
+    assert seen == [IDLE] and fired == 0, seen
+
+
+def test_recheck_counts_each_round():
+    p = Pipeline("Knee Flexion")
+    t, alert, seen, fired = _hold(p, 0.0, FLOOR, 5.5)
+    for expected in (1, 2):
+        p.escalation.ack()
+        t, alert, seen, fired = _hold(p, t, FLOOR, 121.0)
+        assert alert["state"] == COUNTDOWN and alert["rechecks"] == expected, (expected, alert)
+
+
+def test_test_fall_simulation_unchanged_and_never_rechecks():
+    p = Pipeline("Knee Flexion")
+    p.escalation.simulate()                                         # the Test Fall button
+    t, alert, seen, fired = _hold(p, 0.0, STANDING, 1.0)
+    assert alert["state"] == COUNTDOWN, alert                       # standing does not cancel a simulated fall
+    p.escalation.ack()
+    t, alert, seen, fired = _hold(p, t, STANDING, 0.5)
+    assert seen == [ACKNOWLEDGED, IDLE], seen
+    t, alert, seen, fired = _hold(p, t, STANDING, 130.0)
+    assert seen == [IDLE] and fired == 0, seen
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from app.engines import make_engine
 from app.pipeline.annotate import draw
 from app.pipeline.core import Pipeline
 from app.pipeline.rep_counter import EXERCISES
+from app.voice.listener import VoiceListener
 
 ENGINES = {
     "mediapipe": ("mediapipe", {"variant": "full"}),
@@ -115,6 +116,11 @@ class Worker(threading.Thread):
         self.seq = 0
         self.fps = 0.0
         self.latency_ms = 0.0
+        # Smoothed per-stage cost in ms. capture_ms is mostly time spent WAITING for the camera's next frame
+        # (the camera sets the pace), not CPU work, so do not try to optimise it; the other four are real cost.
+        self.timings = {"capture_ms": 0.0, "infer_ms": 0.0, "pipeline_ms": 0.0, "draw_ms": 0.0, "encode_ms": 0.0}
+        self.privacy = False            # requested via POST /api/config; plain bool, read once per frame
+        self.jpeg_private = False       # the published jpeg was encoded with privacy on (guards the stream)
         self.pose_visible = False
         self.error: str | None = None
         self.new_frame = threading.Condition()
@@ -176,23 +182,36 @@ class Worker(threading.Thread):
         while not self.stop_flag.is_set():
             engine = self._apply_pending(engine)
             cap = self._apply_camera(cap)
+            tc = time.perf_counter()
             ok, frame = cap.read() if cap is not None else (False, None)
             if not ok:
                 time.sleep(0.01)
                 continue
             t1 = time.perf_counter()
             res = engine.infer(frame, int((t1 - t0) * 1000))
-            self.latency_ms = (time.perf_counter() - t1) * 1000
+            t2 = time.perf_counter()
+            self.latency_ms = (t2 - t1) * 1000
             self.pose_visible = res is not None
             self.pipeline.process(res, t1 - t0)
+            t3 = time.perf_counter()
+            if voice.active and self.pipeline.last["fall"]["alert"]["state"] not in ("COUNTDOWN", "ALERTED"):
+                voice.stop()                # the fall dialog is gone: close the microphone (a bool check per frame)
+            private = self.privacy         # read once: the blanking and the published flag must agree
+            if private:
+                frame[:] = 0                # in place, after inference and analytics: raw video is never encoded
             if res:
                 draw(frame, res)
+            t4 = time.perf_counter()
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             now = time.perf_counter()
             self.fps = 0.9 * self.fps + 0.1 / max(now - prev, 1e-3)
             prev = now
+            for key, dt in (("capture_ms", t1 - tc), ("infer_ms", t2 - t1), ("pipeline_ms", t3 - t2),
+                            ("draw_ms", t4 - t3), ("encode_ms", now - t4)):      # blanking is part of draw_ms
+                self.timings[key] = 0.9 * self.timings[key] + 0.1 * dt * 1000
             with self.new_frame:
                 self.jpeg = buf.tobytes()
+                self.jpeg_private = private
                 self.seq += 1
                 self.new_frame.notify_all()
         engine.close()
@@ -200,7 +219,7 @@ class Worker(threading.Thread):
             cap.release()
 
     def telemetry(self) -> dict:
-        return {
+        out = {
             "camera_index": self.camera_index,
             "camera_backend": (self.camera_info or {}).get("backend"),
             "camera_error": self.camera_error,
@@ -208,22 +227,32 @@ class Worker(threading.Thread):
             "device": ENGINES[self.engine_name][1].get("device", "cpu"),
             "fps": round(self.fps, 1),
             "latency_ms": round(self.latency_ms, 1),
+            "timings": {k: round(v, 2) for k, v in self.timings.items()},
+            # True only once a blanked frame has actually been published, so the UI can trust it as confirmation
+            "privacy": self.privacy and self.jpeg_private,
             "pose_visible": self.pose_visible,
             "error": self.error,
             "exercise": self.pipeline.exercise,
             **self.pipeline.last,
         }
+        fall = out.get("fall")
+        if fall is not None:
+            out["fall"] = {**fall, "voice": voice.snapshot()}   # a copy: pipeline.last belongs to the worker thread
+        return out
 
 
 worker = Worker()
+voice = VoiceListener(on_ok=worker.pipeline.escalation.ack, on_help=worker.pipeline.escalation.escalate)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     worker.camera_index = default_camera_index()    # enumerated here, not on the worker thread that owns the capture
+    voice.init()                           # checks for the Groq key; the microphone opens only during a fall check
     worker.start()
     yield
     worker.stop_flag.set()
+    voice.quit()
 
 
 app = FastAPI(title="AI Rehab Tracker", lifespan=lifespan)
@@ -233,6 +262,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class Config(BaseModel):
     engine: str | None = None
     exercise: str | None = None
+    privacy: bool | None = None
 
 
 @app.get("/api/health")
@@ -266,6 +296,8 @@ def config(cfg: Config):
         if cfg.exercise not in EXERCISES:
             raise HTTPException(400, f"exercise must be one of {EXERCISE_NAMES}")
         worker.pending_exercise = cfg.exercise
+    if cfg.privacy is not None:
+        worker.privacy = cfg.privacy    # applied by the worker on its next frame
     return worker.telemetry()
 
 
@@ -312,6 +344,22 @@ def fall_ack():
     return {"ok": True}
 
 
+@app.post("/api/fall/listen")
+def fall_listen():
+    """The dialog's spoken prompt has finished: open the microphone (only during a fall check)."""
+    state = worker.pipeline.last.get("fall", {}).get("alert", {}).get("state")
+    if state in ("COUNTDOWN", "ALERTED"):
+        voice.start()
+    return {"ok": True, "status": voice.status, "error": voice.error}
+
+
+@app.post("/api/fall/escalate")
+def fall_escalate():
+    """"Trigger Emergency": skips the rest of the countdown."""
+    worker.pipeline.escalation.escalate()
+    return {"ok": True}
+
+
 @app.post("/api/fall/test")
 def fall_test():
     """TEMP (Test Fall button): simulate a confirmed fall so the countdown dialog can be tried without falling."""
@@ -344,6 +392,8 @@ def mjpeg():
             if worker.jpeg is None:
                 continue
             last, jpeg = worker.seq, worker.jpeg
+            if worker.privacy and not worker.jpeg_private:
+                continue    # privacy was just switched on: the stored frame is raw, wait for a blanked one
         yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
         time.sleep(min_dt)
 
