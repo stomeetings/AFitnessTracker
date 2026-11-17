@@ -1,11 +1,20 @@
-import { useEffect, useState } from "react";
-import { Activity, AlertTriangle, Camera, Cpu, Footprints, Gauge, Info, Loader2, RefreshCw, RotateCcw, ShieldAlert, Timer } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Activity, AlertTriangle, Camera, Cpu, Footprints, Gauge, Info, Loader2, Mic, RefreshCw, RotateCcw, ShieldAlert, Timer } from "lucide-react";
 import { ExerciseGuide } from "./ExerciseGuide";
 import { FallCheck } from "./FallCheck";
+import { RemotePanel, RemoteView } from "./remote/RemoteView";
+import { isLocalHost, nextEngine } from "./remote/logic";
+import { uploadToServer, useVoiceInput } from "./remote/useVoiceInput";
+import { useRemoteSession } from "./remote/useRemoteSession";
+import { Hud } from "./remote/Hud";
+import { useFullscreen } from "./remote/useFullscreen";
+import { VOICE_HELP, VoiceChip } from "./remote/VoiceChip";
+import { intentEffects } from "./remote/voice";
 import { useTelemetry, type Limb } from "./useTelemetry";
 
 const ENGINES = [
   { id: "mediapipe", label: "MediaPipe Full" },
+  { id: "mediapipe_lite", label: "MediaPipe Lite" },
   { id: "yolo", label: "YOLOv11n-Pose GPU" },
 ] as const;
 type CamInfo = { index: number; status: "active" | "ok" | "unavailable"; backend?: string; width?: number; height?: number; reason?: string; name?: string; label?: string };
@@ -103,13 +112,44 @@ function CameraPicker({ active, backend, error }: { active: number | undefined; 
 }
 
 export default function App() {
-  const { t, online } = useTelemetry();
+  // Video source: the server's own camera (default, unchanged) or this device's camera streamed to /ws/session.
+  // The laptop itself starts in "Server camera"; any other address (a phone, a tunnel) starts in "This device".
+  const [mode, setMode] = useState<"local" | "device">(() => {
+    try { const saved = localStorage.getItem("mode"); if (saved === "device" || saved === "local") return saved; } catch { /* no storage */ }
+    return isLocalHost(location.hostname) ? "local" : "device";
+  });
+  const device = mode === "device";
+  const chooseMode = (m: "local" | "device") => {
+    setMode(m);
+    try { localStorage.setItem("mode", m); } catch { /* storage blocked: session-only */ }
+    if (m === "local") remote.stop();
+    else localVoice.end();                  // the desktop page's microphone is for Server camera mode only
+  };
+  const remote = useRemoteSession();
+  const local = useTelemetry(!device);
+  const t = device ? remote.telemetry : local.t;
+  const online = device ? remote.status === "live" : local.online;
+  // The same user actions, routed to whichever source is showing.
+  const act = {
+    exercise: (v: string) => (device ? remote.send("exercise", v) : void post("/api/config", { exercise: v })),
+    reset: () => (device ? remote.send("reset") : void post("/api/reset")),
+    ack: () => (device ? remote.send("ack_fall") : void post("/api/fall/ack")),
+    escalate: () => (device ? remote.send("escalate") : void post("/api/fall/escalate")),
+    testFall: () => (device ? remote.send("test_fall") : void post("/api/fall/test")),
+  };
   const [exercises, setExercises] = useState<string[]>([]);
   useEffect(() => { fetch("/api/exercises").then((r) => r.json()).then(setExercises).catch(() => {}); }, []);
   const [guideInfo, setGuideInfo] = useState<Record<string, { rest: number; peak: number; sides?: string[] }>>({});
   useEffect(() => { fetch("/api/exercise_info").then((r) => r.json()).then(setGuideInfo).catch(() => {}); }, []);
   const [guideOpen, setGuideOpen] = useState(false);
   const guide = t ? guideInfo[t.exercise] : undefined;
+
+  // Standby / active: a phone session starts in standby (skeleton live, reps NOT counted) so stepping into the frame cannot
+  // score; "let's go" / "start my session" / the Start button reset the counts to 0 and start counting, and close the guide.
+  // Pause (or "stop session" on the desktop) goes back to standby. The voice commands do the same on the server (voicecmd.py).
+  const startSession = () => { setGuideOpen(false); if (device) remote.send("start_session"); else void post("/api/session/start"); };
+  const pauseSession = () => { if (device) remote.send("stop_session"); else void post("/api/session/stop"); };
+  const fs = useFullscreen();               // the video wrapper goes full screen with its HUD; modal dialogs still sit on top
 
   const fall = t?.fall?.status ?? "NORMAL";
   const fallAlert = fall !== "NORMAL";
@@ -118,20 +158,72 @@ export default function App() {
   // Privacy mode: the preference lives here (saved in the browser), the backend applies it. Re-sent whenever the
   // backend disagrees (after a change, a backend restart or a reconnect), not on every telemetry tick.
   const [privacyPref, setPrivacyPref] = useState(() => { try { return localStorage.getItem("privacy") === "1"; } catch { return false; } });
-  const togglePrivacy = () => {
-    const v = !privacyPref;
+  const applyPrivacy = (v: boolean) => {
     setPrivacyPref(v);
     try { localStorage.setItem("privacy", v ? "1" : "0"); } catch { /* storage blocked: session-only */ }
   };
+  const togglePrivacy = () => applyPrivacy(!privacyPref);
+
+  // ---- Voice commands: ONE path for both modes ----------------------------------------------------------------
+  // Microphone and upload differ (a phone's session socket, the desktop page's POST /api/voice); what a command MEANS
+  // is decided by the same server code (app/voicecmd.py) and what it CHANGES here is decided by `intentEffects` only.
+  const fallOpen = alert?.state === "COUNTDOWN" || alert?.state === "ALERTED";
+  const localVoice = useVoiceInput(uploadToServer);
+  const voice = device ? remote.voice : localVoice;
+  // "Preview" = the Exercise Guide modal (the Info button's): show / display preview opens it, hide / close preview closes it.
+  const heardSeq = voice.heard.seq, heardIntent = voice.heard.intent;
+  const commandTimer = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (!heardSeq) return;
+    console.info("[voice] heard", JSON.stringify(voice.heard.text), "-> intent:", heardIntent);   // diagnostic: what the server understood
+    if (!heardIntent) return;                        // talk that was not a command must not cancel one already waiting
+    // The chip shows `Heard: "..."` right away; the change itself follows a moment later so it can be read first.
+    window.clearTimeout(commandTimer.current);       // a newer command replaces an older one that has not run yet
+    commandTimer.current = window.setTimeout(() => {
+      const fx = intentEffects(heardIntent, device);
+      console.info("[voice] applying", heardIntent, fx);
+      if (fx.showGuide !== undefined) setGuideOpen(fx.showGuide);      // the Exercise Guide: the same state the Info button sets
+      if (fx.stopDeviceSession) remote.stop();
+    }, 700);
+  }, [heardSeq]);   // eslint-disable-line react-hooks/exhaustive-deps -- one run per spoken sentence
+  useEffect(() => () => window.clearTimeout(commandTimer.current), []);
+  // A phone session that ends for any reason (stop, interrupted camera) closes the guide (a completed session).
+  const lastStatus = useRef(remote.status);
+  useEffect(() => {
+    const was = lastStatus.current;
+    lastStatus.current = remote.status;
+    if (remote.status === "idle" && was !== "idle" && was !== "starting") setGuideOpen(false);
+  }, [remote.status]);
+  // Server camera: the browser microphone is opt-in (a tap; remembered, and restarted by itself when the browser has
+  // already granted it). While the fall dialog is open the BACKEND's microphone answers it, so the browser releases its own.
+  const toggleLocalVoice = () => {
+    const on = localVoice.mic === "off" || localVoice.mic === "blocked" || localVoice.mic === "unavailable";
+    try { localStorage.setItem("voiceLocal", on ? "1" : "0"); } catch { /* storage blocked */ }
+    if (on) void localVoice.enable(); else localVoice.end();
+  };
+  useEffect(() => {
+    if (device) return;
+    try { if (localStorage.getItem("voiceLocal") !== "1") return; } catch { return; }
+    navigator.permissions?.query({ name: "microphone" as PermissionName })
+      .then((p) => { if (p.state === "granted") void localVoice.enable(); }).catch(() => {});
+  }, []);   // eslint-disable-line react-hooks/exhaustive-deps -- once, on load
+  const resumeVoice = useRef(false);
+  useEffect(() => {
+    if (device) return;
+    if (fallOpen && localVoice.mic !== "off") { resumeVoice.current = true; localVoice.end(); }
+    else if (!fallOpen && resumeVoice.current) { resumeVoice.current = false; void localVoice.enable(); }
+  }, [fallOpen, device]);   // eslint-disable-line react-hooks/exhaustive-deps
+
   const backendPrivacy = t?.privacy;
   useEffect(() => {
-    if (backendPrivacy !== undefined && backendPrivacy !== privacyPref) post("/api/config", { privacy: privacyPref });
-  }, [backendPrivacy, privacyPref, online]);   // `online` re-checks after a reconnect
-  // Never show video the backend has not confirmed is blanked (covers page load and backend restarts).
-  const hideVideo = privacyPref && !(online && t?.privacy);
+    if (!device && backendPrivacy !== undefined && backendPrivacy !== privacyPref) post("/api/config", { privacy: privacyPref });
+  }, [device, backendPrivacy, privacyPref, online]);   // `online` re-checks after a reconnect
+  // Never show video the backend has not confirmed is blanked (covers page load and backend restarts). With this
+  // device's camera the preview is local, so hiding it is immediate.
+  const hideVideo = privacyPref && (device || !(online && t?.privacy));
 
   return (
-    <div className="min-h-screen p-6">
+    <div className="min-h-screen p-3 sm:p-6">
       {fallAlert && (
         <div className={`mb-4 flex items-center gap-3 rounded-xl border px-4 py-3 text-lg font-semibold ${fall === "CONFIRMED" ? "animate-pulse border-red-500 bg-red-600 text-white" : "border-amber-500 bg-amber-500/20 text-amber-200"}`}>
           <AlertTriangle />
@@ -140,9 +232,15 @@ export default function App() {
         </div>
       )}
 
-      <header className="mb-6 flex items-center gap-3">
+      <header className="mb-6 flex flex-wrap items-center gap-3">
         <Activity className="text-emerald-400" />
         <h1 className="text-xl font-semibold">AI Rehab Tracker</h1>
+        <div role="group" aria-label="Video source" className="flex rounded-full border border-slate-700 p-0.5 text-xs">
+          {([["local", "Server camera"], ["device", "This device"]] as const).map(([m, label]) => (
+            <button key={m} aria-pressed={mode === m} onClick={() => chooseMode(m)}
+              className={`rounded-full px-3 py-1 ${mode === m ? "bg-emerald-500 text-slate-950" : "text-slate-300 hover:bg-slate-800"}`}>{label}</button>
+          ))}
+        </div>
         <button role="switch" aria-checked={privacyPref} onClick={togglePrivacy}
           title="Privacy mode: hide the camera image and stream only the skeleton on a black background"
           className="ml-auto flex items-center gap-2 rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300 hover:bg-slate-800">
@@ -151,8 +249,15 @@ export default function App() {
             <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${privacyPref ? "left-3.5" : "left-0.5"}`} />
           </span>
         </button>
+        {!device && (
+          <button onClick={toggleLocalVoice} aria-pressed={localVoice.mic !== "off"}
+            title="Voice commands through this computer's microphone (the browser records, the server understands)"
+            className={`flex items-center gap-1 rounded-full border px-3 py-1 text-xs hover:bg-slate-800 ${localVoice.mic === "off" ? "border-slate-700 text-slate-300" : "border-emerald-600 text-emerald-300"}`}>
+            <Mic size={12} /> Voice
+          </button>
+        )}
         {/* TEMP: remove with POST /api/fall/test once the fall dialog has been tested */}
-        <button onClick={() => post("/api/fall/test")} title="Simulate a fall to test the Are-you-okay dialog (temporary)"
+        <button onClick={act.testFall} title="Simulate a fall to test the Are-you-okay dialog (temporary)"
           className="rounded-full border border-amber-600 px-3 py-1 text-xs text-amber-300 hover:bg-amber-500/10">
           Test Fall
         </button>
@@ -160,34 +265,60 @@ export default function App() {
       </header>
 
       <main className="grid gap-6 lg:grid-cols-[1fr_360px]">
-        <section className={`relative overflow-hidden rounded-2xl border bg-black ${fall === "CONFIRMED" ? "border-red-500" : "border-slate-800"}`}>
-          <img src="/api/video_feed" alt="live feed" className={`block aspect-[4/3] w-full object-contain ${hideVideo ? "invisible" : ""}`} />
-          <div className="absolute left-3 top-3 flex items-center gap-2 rounded-full bg-slate-900/80 px-3 py-1 text-xs backdrop-blur">
-            <span className={`h-2 w-2 rounded-full ${online ? "bg-emerald-400" : "bg-red-500"}`} />
-            {online ? (t?.pose_visible ? `LIVE · ${t?.posture ?? "pose"}` : "LIVE · no pose") : "OFFLINE"}
-          </div>
+        <section ref={fs.ref}
+          className={fs.full ? "fixed inset-0 z-40 overflow-hidden bg-black"
+            : `relative overflow-hidden rounded-2xl border bg-black ${fall === "CONFIRMED" ? "border-red-500" : "border-slate-800"}`}>
+          {device ? (
+            <RemoteView s={remote} hidden={privacyPref} level={fall === "CONFIRMED" ? "confirmed" : fall === "SUSPECTED" ? "suspected" : "ok"}
+              full={fs.full} onToggleFull={fs.toggle} onStart={startSession} onPause={pauseSession} />
+          ) : (
+            <>
+              <img src="/api/video_feed" alt="live feed"
+                className={`block w-full object-contain ${fs.full ? "h-full" : "aspect-[4/3]"} ${hideVideo ? "invisible" : ""}`} />
+              <Hud
+                status={online ? (t?.pose_visible ? `LIVE · ${t?.posture ?? "pose"}` : "LIVE · no pose") : "OFFLINE"}
+                statusTone={online ? "ok" : "bad"}
+                counting={online ? t?.counting : undefined}
+                reps={online ? t?.reps : undefined}
+                fall={fall}
+                model={online && t?.engine ? {
+                  name: t.engine, ms: Math.round((t.timings?.infer_ms ?? 0) * 10) / 10,
+                  other: nextEngine(t.engine, ENGINES.map((e) => e.id)), wanted: null,
+                  onSwitch: () => { const n = nextEngine(t.engine ?? null, ENGINES.map((e) => e.id)); if (n) void post("/api/config", { engine: n }); },
+                } : null}
+                full={fs.full} onToggleFull={fs.toggle} onStart={startSession} onPause={pauseSession}
+                extra={localVoice.mic !== "off" ? <VoiceChip mic={localVoice.mic} error={localVoice.micError} heard={localVoice.heard.text} intent={localVoice.heard.intent} /> : null}
+              />
+            </>
+          )}
         </section>
 
         <aside className="flex flex-col gap-4">
-          <CameraPicker active={t?.camera_index} backend={t?.camera_backend} error={t?.camera_error} />
+          {device ? <RemotePanel s={remote} /> : <CameraPicker active={t?.camera_index} backend={t?.camera_backend} error={t?.camera_error} />}
+          {!device && localVoice.mic !== "off" && (
+            <div className={`text-xs ${localVoice.mic === "blocked" || localVoice.mic === "unavailable" ? "text-amber-400" : "text-slate-500"}`}>
+              {localVoice.micError ?? ""}
+              <div className="text-[10px] text-slate-600">{VOICE_HELP}</div>
+            </div>
+          )}
 
-          <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
+          {!device && (<div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
             <div className="mb-2 text-xs uppercase tracking-wide text-slate-400">Pose engine</div>
-            <div className="grid grid-cols-2 gap-1 rounded-lg bg-slate-800 p-1">
+            <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-800 p-1">
               {ENGINES.map((e) => (
                 <button key={e.id} onClick={() => post("/api/config", { engine: e.id })}
-                  className={`rounded-md px-2 py-1.5 text-sm transition ${t?.engine === e.id ? "bg-emerald-500 text-slate-950" : "text-slate-300 hover:bg-slate-700"}`}>
+                  className={`rounded-md px-1 py-1.5 text-xs transition ${t?.engine === e.id ? "bg-emerald-500 text-slate-950" : "text-slate-300 hover:bg-slate-700"}`}>
                   {e.label}
                 </button>
               ))}
             </div>
             <div className="mt-2 text-xs text-slate-500">device: {t?.device ?? "…"}</div>
-          </div>
+          </div>)}
 
           <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
             <label className="mb-2 block text-xs uppercase tracking-wide text-slate-400">Exercise</label>
             <div className="flex gap-2">
-              <select value={t?.exercise ?? ""} onChange={(e) => post("/api/config", { exercise: e.target.value })}
+              <select value={t?.exercise ?? ""} onChange={(e) => act.exercise(e.target.value)}
                 className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm">
                 {exercises.map((x) => <option key={x}>{x}</option>)}
               </select>
@@ -195,7 +326,7 @@ export default function App() {
                 className="flex items-center rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm hover:bg-slate-700 disabled:opacity-50">
                 <Info size={14} />
               </button>
-              <button onClick={() => post("/api/reset")} title="Reset session"
+              <button onClick={act.reset} title="Reset session"
                 className="flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm hover:bg-slate-700">
                 <RotateCcw size={14} /> Reset
               </button>
@@ -229,7 +360,7 @@ export default function App() {
         </aside>
       </main>
       {guideOpen && guide && t && <ExerciseGuide info={guideInfo} initial={t.exercise} onClose={() => setGuideOpen(false)} />}
-      {alert && (alert.state === "COUNTDOWN" || alert.state === "ALERTED") && <FallCheck alert={alert} voice={t?.fall?.voice} />}
+      {alert && (alert.state === "COUNTDOWN" || alert.state === "ALERTED") && <FallCheck alert={alert} voice={device ? remote.voice.voiceState : t?.fall?.voice} onAck={act.ack} onEscalate={act.escalate} canListen={!device} />}
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, VolumeX } from "lucide-react";
+import { holdQuiet } from "./remote/voice";
 import type { FallAlert, VoiceState } from "./useTelemetry";
 
 /** Full-screen "Are you okay?" check shown while the backend's fall escalation is in COUNTDOWN or ALERTED.
@@ -44,7 +45,10 @@ const startListening = () => {
     .catch((e) => console.warn("[voice] DEBUG: /api/fall/listen failed", e));
 };
 
-export function FallCheck({ alert, voice }: { alert: FallAlert; voice?: VoiceState }) {
+/** `onAck` / `onEscalate` default to the server-camera endpoints; the browser-camera mode sends them over its socket
+ *  instead. `canListen` is false there: the microphone is opened by the backend, which has none for a remote patient. */
+export function FallCheck({ alert, voice, onAck = () => post("/api/fall/ack"), onEscalate = () => post("/api/fall/escalate"), canListen = true }:
+  { alert: FallAlert; voice?: VoiceState; onAck?: () => void; onEscalate?: () => void; canListen?: boolean }) {
   const ref = useRef<HTMLDialogElement>(null);
   const audio = useRef<AudioContext | null>(null);
   const speakId = useRef(0);
@@ -71,7 +75,7 @@ export function FallCheck({ alert, voice }: { alert: FallAlert; voice?: VoiceSta
     // it has finished. The id check ignores the end event of a prompt that was cancelled by a newer one.
     const id = ++speakId.current;
     let timer: number | undefined;
-    const listen = () => { if (id === speakId.current) startListening(); };
+    const listen = () => { if (canListen && id === speakId.current) startListening(); };
     timer = window.setTimeout(() => {
       console.warn("[voice] DEBUG: the spoken prompt reported no end after 6 s, opening the microphone anyway");
       listen();
@@ -88,7 +92,11 @@ export function FallCheck({ alert, voice }: { alert: FallAlert; voice?: VoiceSta
     console.log("[voice] DEBUG: backend voice status:", voice?.status ?? "(none)", voice?.error ?? "",
       voice?.transcript ? `heard: ${JSON.stringify(voice.transcript)} -> ${voice.intent}` : "");
   }, [voice?.status, voice?.error, voice?.transcript, voice?.intent]);       // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { if (!alerted) beep(audio.current, 880, 0.15); }, [second, alerted]);    // one tick per second
+  useEffect(() => {                                                                          // one tick per second
+    if (alerted) return;
+    beep(audio.current, 880, 0.15);
+    holdQuiet(400);                      // the browser microphone (device mode) must not take the tick for speech
+  }, [second, alerted]);
   useEffect(() => {                                                                          // two-tone alarm
     if (!alerted) return;
     let high = false;
@@ -96,8 +104,8 @@ export function FallCheck({ alert, voice }: { alert: FallAlert; voice?: VoiceSta
     return () => window.clearInterval(id);
   }, [alerted]);
 
-  const ack = () => post("/api/fall/ack");
-  const escalate = () => post("/api/fall/escalate");
+  const ack = onAck;
+  const escalate = onEscalate;
 
   return (
     <dialog ref={ref} role="alertdialog" aria-labelledby="fall-check-title"
