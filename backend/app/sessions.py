@@ -137,6 +137,8 @@ class Session:
             self.pipeline.reset()
             self.pending_reset = False
         if self.pending_counting is not None:                # after the reset, so "start" = zero counts AND counting
+            if self.pending_counting and not self.pipeline.counting:
+                self.pipeline.calibrate()                    # standby -> counting: the rest angles from the posture just held
             self.pipeline.counting = self.pending_counting
             self.pending_counting = None
         if self.pending_baseline_reset:

@@ -3,7 +3,7 @@ import { Activity, AlertTriangle, Camera, Cpu, Footprints, Gauge, Info, Loader2,
 import { ExerciseGuide } from "./ExerciseGuide";
 import { FallCheck } from "./FallCheck";
 import { RemotePanel, RemoteView } from "./remote/RemoteView";
-import { isLocalHost, nextEngine } from "./remote/logic";
+import { calibrationNote, isLocalHost, nextEngine } from "./remote/logic";
 import { uploadToServer, useVoiceInput } from "./remote/useVoiceInput";
 import { useRemoteSession } from "./remote/useRemoteSession";
 import { Hud } from "./remote/Hud";
@@ -280,6 +280,7 @@ export default function App() {
                 statusTone={online ? "ok" : "bad"}
                 counting={online ? t?.counting : undefined}
                 reps={online ? t?.reps : undefined}
+                note={online ? calibrationNote(t?.reps) : undefined}
                 fall={fall}
                 model={online && t?.engine ? {
                   name: t.engine, ms: Math.round((t.timings?.infer_ms ?? 0) * 10) / 10,

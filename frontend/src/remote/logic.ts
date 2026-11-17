@@ -109,6 +109,28 @@ export function landmarksToKeypoints(landmarks: ReadonlyArray<{ x: number; y: nu
   return out;
 }
 
+/** Joint name -> [x, y, z] in METRES from the hip centre (MediaPipe's world landmarks), the same joint names as `Keypoints`. */
+export type World = Record<string, [number, number, number]>;
+
+/** MediaPipe's 33 world landmarks as the 17 named joints, millimetre precision (3 decimals, metres). Angles measured in these do
+ *  not depend on the camera's viewing angle, unlike angles measured in the image (a knee bending toward the camera barely changes
+ *  in 2D). The server uses them when every joint of an angle has one. */
+export function worldToJoints(world: ReadonlyArray<{ x: number; y: number; z: number }>): World {
+  const out: World = {};
+  for (const [index, name] of Object.entries(LANDMARK_JOINTS)) {
+    const p = world[Number(index)];
+    if (p) out[name] = [Math.round(p.x * 1000) / 1000, Math.round(p.y * 1000) / 1000, Math.round(p.z * 1000) / 1000];
+  }
+  return out;
+}
+
+/** What the HUD says about the rest angles measured in standby ("calibrated rest 92°"), or undefined when none was. */
+export function calibrationNote(reps?: Record<string, { calibrated?: boolean; rest?: number }>): string | undefined {
+  const done = Object.entries(reps ?? {}).filter(([, l]) => l.calibrated && l.rest !== undefined);
+  if (!done.length) return undefined;
+  return "calibrated rest " + done.map(([side, l]) => `${done.length > 1 ? `${side} ` : ""}${Math.round(l.rest!)}°`).join(" · ");
+}
+
 /** Bounding box [x, y, w, h] of the confident joints, padded; null with fewer than 4 (no person to outline). For drawing only:
  *  the server works out its own. */
 export function bboxFromKeypoints(kp: Keypoints, minConf = 0.5, pad = 0.05): [number, number, number, number] | null {
@@ -122,8 +144,8 @@ export function bboxFromKeypoints(kp: Keypoints, minConf = 0.5, pad = 0.05): [nu
 
 /** The `kp` message the server's gateway expects (backend/app/remote.py). `"type":"kp"` must come first: the server tells these
  *  messages apart by that prefix. */
-export const keypointMessage = (seq: number, tMs: number, w: number, h: number, kp: Keypoints): string =>
-  JSON.stringify({ type: "kp", seq, t: Math.round(tMs * 10) / 10, w, h, kp });
+export const keypointMessage = (seq: number, tMs: number, w: number, h: number, kp: Keypoints, world?: World): string =>
+  JSON.stringify({ type: "kp", seq, t: Math.round(tMs * 10) / 10, w, h, kp, ...(world ? { world } : {}) });
 
 /** A phone or tablet (iPadOS reports itself as a Mac with a touch screen). */
 export const isMobileDevice = (userAgent: string, maxTouchPoints: number): boolean =>

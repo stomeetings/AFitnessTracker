@@ -1,5 +1,5 @@
 import type { PoseLandmarker } from "@mediapipe/tasks-vision";
-import { canRunInference, landmarksToKeypoints, type Keypoints } from "./logic";
+import { canRunInference, landmarksToKeypoints, worldToJoints, type Keypoints, type World } from "./logic";
 
 /** MediaPipe Pose Landmarker running in this browser (WebAssembly, on the GPU where the phone allows it): the pose is computed
  *  where the camera is, so no video crosses the network, and the skeleton is drawn from the same pass with no round trip.
@@ -43,8 +43,9 @@ export async function createLandmarker(): Promise<LoadedLandmarker> {
 }
 
 export type LoopHooks = {
-  /** One result per processed video frame: the joints in pixels of the w x h frame (null = nobody found), and its time. */
-  pose: (kp: Keypoints | null, w: number, h: number, tMs: number) => void;
+  /** One result per processed video frame: the joints in pixels of the w x h frame (null = nobody found), its time, and the
+   *  metric 3D world joints when the model gave them (the server then measures angles independent of the view). */
+  pose: (kp: Keypoints | null, w: number, h: number, tMs: number, world?: World) => void;
   /** About twice a second: frames per second achieved and the smoothed time one detection takes, in ms. */
   stats: (fps: number, ms: number) => void;
   /** The model threw (the loop stops). */
@@ -75,7 +76,9 @@ export function runLocalLoop(getVideo: () => HTMLVideoElement | null, landmarker
         if (lastRun) fps = fps ? 0.8 * fps + 0.2 * (1000 / (now - lastRun)) : 1000 / (now - lastRun);
         lastRun = now;
         const lm = result.landmarks[0];
-        on.pose(lm ? landmarksToKeypoints(lm, video.videoWidth, video.videoHeight) : null, video.videoWidth, video.videoHeight, now);
+        const wl = result.worldLandmarks?.[0];
+        on.pose(lm ? landmarksToKeypoints(lm, video.videoWidth, video.videoHeight) : null, video.videoWidth, video.videoHeight, now,
+          lm && wl ? worldToJoints(wl) : undefined);
       } catch (e) {
         stopped = true;
         on.failed(e);

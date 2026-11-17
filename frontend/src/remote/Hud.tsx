@@ -19,6 +19,7 @@ export type HudProps = {
   onStart: () => void;                                  // standby -> counting from zero
   onPause: () => void;                                  // counting -> standby
   extra?: ReactNode;                                    // the voice chip
+  note?: string;                                        // e.g. "calibrated rest 92°": what the standby measured for this person
 };
 
 const TONE = { ok: "bg-emerald-400", warn: "bg-amber-400", bad: "bg-red-500" } as const;
@@ -44,6 +45,11 @@ export function Hud(p: HudProps) {
           {p.counting !== undefined && (
             <span role="status" className={`rounded-full px-3 py-1 text-xs font-bold backdrop-blur ${standby ? "bg-amber-400 text-slate-950" : "bg-emerald-500 text-slate-950"}`}>
               {standby ? "READY — Say “Let’s go” to start" : "ACTIVE"}
+            </span>
+          )}
+          {p.note && !standby && (
+            <span className="rounded-full bg-slate-900/80 px-3 py-1 text-xs text-slate-300 backdrop-blur" title="Your starting angle, measured while you held still before you started">
+              {p.note}
             </span>
           )}
           {p.fall !== "NORMAL" && (

@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 
-export type Limb = { reps: number; state: string; angle: number | null; last_rom: number; best_rom: number };
+export type Limb = {
+  reps: number; state: string; angle: number | null; last_rom: number; best_rom: number;
+  rest?: number; peak?: number;      // the angles in use for rep counting
+  calibrated?: boolean;              // rest was measured from this person's own starting posture (standby), not the table's
+};
 export type FallAlert = { state: "IDLE" | "COUNTDOWN" | "ALERTED" | "ACKNOWLEDGED"; seconds_left: number; impact: boolean; rechecks?: number };
 export type VoiceState = {
   status: "off" | "unavailable" | "idle" | "starting" | "listening" | "transcribing";

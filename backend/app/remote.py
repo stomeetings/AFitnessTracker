@@ -10,9 +10,10 @@ Wire protocol (one socket = one session; see docs/cloud_mobile_blueprint.md sect
                      ...the session's telemetry...}                      one per processed frame ("error" if it failed)
   client -> server  {"type":"cmd","name":"exercise","value":"Elbow Curl"} | "reset" | "ack_fall" | "escalate" | "test_fall"
   server -> client  {"type":"cmd_result","name":...,"ok":true|false,"error":...}
-  client -> server  {"type":"kp","seq":n,"t":capture_ms,"w":W,"h":H,"kp":{"l_shoulder":[x,y,conf],...}}
+  client -> server  {"type":"kp","seq":n,"t":capture_ms,"w":W,"h":H,"kp":{"l_shoulder":[x,y,conf],...},"world":{"l_shoulder":[x,y,z],...}}
       the pose computed ON THE PHONE (no video is sent): x, y in pixels of a W x H frame, conf 0..1, names from
-      engines.base.KEYPOINT_NAMES; "kp":{} = nobody in view. The server runs the same analytics on it (reps, falls, escalation)
+      engines.base.KEYPOINT_NAMES; "kp":{} = nobody in view. The optional "world" holds MediaPipe's metric 3D landmarks (metres from the
+      hip centre): with them the server measures joint angles in 3D, which does not change with the camera's viewing angle. The server runs the same analytics on it (reps, falls, escalation)
       and answers with the usual "t" telemetry, at most ~10 per second and WITHOUT "pose" (the phone already has it).
       The client does not wait for answers: send at the model's own pace; only the newest waiting message is processed.
   client -> server  {"type":"audio","mime":"audio/webm;codecs=opus","data":"<base64>"}      one spoken utterance (<= 400 kB)
@@ -64,6 +65,7 @@ AUDIO_PREFIX = '{"type":"audio"'    # the client writes the type first, so the (
 KP_PREFIX = '{"type":"kp"'          # likewise for keypoint messages (the pose computed on the phone)
 KP_REPLY_GAP_S = 0.1                # telemetry answers to keypoint messages: at most 10 a second
 MAX_FRAME_SIDE = 4096               # a believable frame size for a keypoint message
+MAX_WORLD_M = 3.0                   # world landmarks are metres from the hip centre: a body is within ~1 m of it
 MAX_AUDIO_TEXT = MAX_AUDIO_BYTES * 4 // 3 + 200      # an utterance base64 encoded, plus the JSON around it
 MAX_PENDING = 16                    # sockets accepted but not yet authenticated, so they cannot pile up
 CLOSE_UNAUTHORIZED = 4401           # application close code: token missing or wrong
@@ -110,6 +112,21 @@ def parse_keypoints(text: str) -> tuple[int, float, int, int, PoseResult | None]
         if not all(math.isfinite(v) for v in (x, y, conf)):
             raise ValueError("bad joint value")
         kps[name] = Keypoint(x, y, min(1.0, max(0.0, conf)))
+    world = msg.get("world")                    # optional: MediaPipe's metric 3D landmarks, so angles do not depend on the view
+    if world is not None:
+        if not isinstance(world, dict):
+            raise ValueError("bad keypoint message")
+        for name, value in world.items():
+            if name not in KEYPOINT_NAMES:
+                raise ValueError(f"unknown joint {str(name)[:20]!r}")
+            try:
+                x, y, z = (float(v) for v in value)
+            except (ValueError, TypeError):
+                raise ValueError("bad joint value") from None
+            if not all(math.isfinite(v) and abs(v) <= MAX_WORLD_M for v in (x, y, z)):
+                raise ValueError("bad joint value")
+            if name in kps:
+                kps[name].world = (x, y, z)
     bbox = bbox_from_keypoints(kps, (height, width), 0.5) if kps else None
     return seq, t_ms, width, height, (PoseResult(kps, bbox, int(t_ms)) if bbox is not None else None)
 

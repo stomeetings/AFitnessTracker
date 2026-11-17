@@ -184,12 +184,12 @@ export function useRemoteSession() {
     const { landmarker, delegate } = landmarkerRef.current;
     setLocal((l) => ({ ...l, status: "running", delegate }));
     loopRef.current = runLocalLoop(() => videoRef.current, landmarker, {
-      pose: (kp, w, h, tMs) => {
+      pose: (kp, w, h, tMs, world) => {
         const box = kp ? bboxFromKeypoints(kp) : null;
         poseListener.current?.(kp && box ? { kp, bbox: box } : null, { w, h });      // the skeleton, with no network in between
         const sock = ws.current;
         if (sock && sock.readyState === WebSocket.OPEN && opened.current && sock.bufferedAmount < 65536) {   // never build a backlog
-          sock.send(keypointMessage(++kpSeq.current, tMs, w, h, kp ?? {}));
+          sock.send(keypointMessage(++kpSeq.current, tMs, w, h, kp ?? {}, kp ? world : undefined));
         }
       },
       stats: (fps, ms) => setLocal((l) => ({ ...l, fps, ms })),

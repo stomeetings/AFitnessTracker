@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { calibrationNote, worldToJoints } from "./logic";
 import { LANDMARK_JOINTS, MAX_LOCAL_FPS, ON_DEVICE, bboxFromKeypoints, canRunInference, defaultInference, isMobileDevice, keypointMessage, landmarksToKeypoints } from "./logic";
 import { ACK_TIMEOUT_MS, MAX_QUALITY, MIN_FRAME_GAP_MS, MIN_QUALITY, SKELETON, canSendFrame, captureSize, drawPose, engineLabel, extractToken, fitContain, isLocalHost, nextEngine, nextQuality, packFrame, reconnectDelay, type Pose } from "./logic";
 
@@ -125,6 +126,34 @@ describe("on-device pose helpers", () => {
     expect(engineLabel(ON_DEVICE)).toBe("On-device MediaPipe");
     expect(nextEngine(ON_DEVICE, [ON_DEVICE, "mediapipe", "yolo"])).toBe("mediapipe");
     expect(nextEngine("yolo", [ON_DEVICE, "mediapipe", "yolo"])).toBe(ON_DEVICE);
+  });
+});
+
+describe("world landmarks and the calibration note", () => {
+  it("maps the world landmarks onto the joint names at millimetre precision, in metres", () => {
+    const all = Array.from({ length: 33 }, () => ({ x: 0, y: 0, z: 0 }));
+    all[25] = { x: 0.12345, y: -0.5, z: 0.0004 };                       // l_knee
+    const joints = worldToJoints(all);
+    expect(Object.keys(joints)).toHaveLength(17);
+    expect(joints.l_knee).toEqual([0.123, -0.5, 0]);
+    expect(worldToJoints([])).toEqual({});
+  });
+
+  it("puts the world joints in the message only when there are some, with the type still first", () => {
+    const lms = Array.from({ length: 33 }, (_, i) => ({ x: 0.1 + i / 100, y: 0.2, z: 0.05, visibility: 0.9 }));
+    const kp = landmarksToKeypoints(lms, 1280, 720);
+    const withWorld = keypointMessage(3, 99.5, 1280, 720, kp, worldToJoints(lms));
+    expect(withWorld.startsWith('{"type":"kp"')).toBe(true);
+    expect(JSON.parse(withWorld).world.l_knee).toEqual([0.35, 0.2, 0.05].map((v) => Math.round(v * 1000) / 1000));
+    expect(withWorld.length).toBeLessThan(4096);                       // the server refuses longer text messages
+    expect("world" in JSON.parse(keypointMessage(3, 99.5, 1280, 720, kp))).toBe(false);
+  });
+
+  it("describes the rest angles measured in standby for the HUD", () => {
+    expect(calibrationNote(undefined)).toBeUndefined();
+    expect(calibrationNote({ L: { calibrated: false, rest: 170 } })).toBeUndefined();
+    expect(calibrationNote({ B: { calibrated: true, rest: 91.6 } })).toBe("calibrated rest 92°");
+    expect(calibrationNote({ L: { calibrated: true, rest: 90.2 }, R: { calibrated: true, rest: 95.4 } })).toBe("calibrated rest L 90° · R 95°");
   });
 });
 

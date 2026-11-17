@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, Loader2, Play, SwitchCamera, Square } from "lucide-react";
 import { Hud } from "./Hud";
-import { drawPose, engineLabel, nextEngine, type AlertLevel, type Pose } from "./logic";
+import { calibrationNote, drawPose, engineLabel, nextEngine, type AlertLevel, type Pose } from "./logic";
 import type { Facing, RemoteSession as Session, RemoteStatus } from "./useRemoteSession";
 import { MIC_TEXT, VOICE_HELP, VoiceChip } from "./VoiceChip";
 
@@ -88,6 +88,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
         statusTone={s.status === "live" ? "ok" : s.status === "error" ? "bad" : "warn"}
         counting={s.status === "live" ? t?.counting : undefined}
         reps={s.status === "live" ? t?.reps : undefined}
+        note={s.status === "live" ? calibrationNote(t?.reps) : undefined}
         fall={t?.fall?.status ?? "NORMAL"}
         model={running && s.model ? {
           name: s.model, ms: s.modelMs, fps: s.inference === "device" ? s.local.fps : undefined, other: otherModel, wanted: s.modelWanted,

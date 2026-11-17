@@ -2076,6 +2076,194 @@ def test_the_browser_model_route_serves_only_the_two_pose_models():
     assert client.get("/models/yolo11n-pose-320.onnx").status_code == 404      # the removed client-side YOLO model is not served
 
 
+# ---- Phase A: 3D world landmarks, rest calibration in standby, time-based smoothing ----------------------------------------------
+
+def test_time_based_smoothing_reacts_the_same_over_time_at_any_frame_rate():
+    from app.pipeline.core import SMOOTH_TAU_S
+    reached = {}
+    for fps in (10, 30, 60):
+        ema = EMA(tau=SMOOTH_TAU_S)
+        ema.update({"a": 0.0}, 0.0)
+        v = 0.0
+        for i in range(1, round(0.3 * fps) + 1):                              # the input steps from 0 to 100, for 0.3 s
+            v = ema.update({"a": 100.0}, i / fps)["a"]
+        reached[fps] = v
+    expected = 100 * (1 - math.exp(-0.3 / SMOOTH_TAU_S))
+    assert all(abs(v - expected) < 1e-6 for v in reached.values()), reached     # a slow phone no longer lags a fast one
+    old3, old9 = EMA(0.35), EMA(0.35)                                          # the fixed-alpha filter did: 3 updates vs 9 differ widely
+    old3.update({"a": 0.0}); old9.update({"a": 0.0})
+    for _ in range(3):
+        a3 = old3.update({"a": 100.0})["a"]
+    for _ in range(9):
+        a9 = old9.update({"a": 100.0})["a"]
+    assert a9 - a3 > 20
+    ema = EMA(tau=SMOOTH_TAU_S)
+    ema.update({"a": 0.0}, 1.0)
+    assert ema.update({"a": 100.0}, 1.0)["a"] == 0.0                            # a repeated timestamp holds the value
+    assert 0 < ema.update({"a": 100.0}, 1.05)["a"] < 100
+    ema.reset()
+    assert ema.update({"a": 7.0}, 5.0)["a"] == 7.0                              # a fresh start takes the first value as it is
+    assert Pipeline("Elbow Curl").ema.tau == SMOOTH_TAU_S                       # and the pipeline uses it
+
+
+def test_joint_angles_use_the_3d_world_landmarks_when_every_joint_has_them():
+    box = BBox(280, 180, 40, 240, 0.9)
+    # A knee bending TOWARD the camera: in the image hip, knee and ankle sit on one vertical line (180 degrees), but in metres the
+    # thigh points down and the shank points at the camera (90 degrees).
+    res = PoseResult({
+        "l_hip": Keypoint(300, 200, 0.95, (0.0, 0.0, 0.0)),
+        "l_knee": Keypoint(300, 300, 0.95, (0.0, 0.4, 0.0)),
+        "l_ankle": Keypoint(300, 400, 0.95, (0.0, 0.4, -0.4)),
+    }, box, 0)
+    assert abs(joint_angles(res)["l_knee"] - 90) < 1e-6
+    assert abs(joint_angles(res, use_3d=False)["l_knee"] - 180) < 1e-6
+    res.keypoints["l_ankle"].world = None                                      # one joint without 3D: the image angle is used
+    assert abs(joint_angles(res)["l_knee"] - 180) < 1e-6
+
+
+def test_keypoint_messages_can_carry_world_landmarks():
+    from app.remote import parse_keypoints
+    pose = _pose(240, 0)
+    world = {n: [round(k.x / 1000, 3), round(k.y / 1000, 3), 0.1] for n, k in pose.keypoints.items()}
+
+    def text(**changes):
+        body = {"type": "kp", "seq": 1, "t": 10.0, "w": 640, "h": 480, "kp": _kp(pose), "world": world}
+        body.update(changes)
+        return json.dumps(body, separators=(",", ":"))
+    parsed = parse_keypoints(text())[4]
+    assert all(parsed.keypoints[n].world == tuple(v) for n, v in world.items())      # attached to the joints
+    assert parse_keypoints(_kp_text(pose))[4].keypoints["l_hip"].world is None        # still optional
+    assert to_reference(parsed, 1280).keypoints["l_hip"].world == parsed.keypoints["l_hip"].world    # survives rescaling
+    extra = dict(world, r_foot_index=[0.1, 0.2, 0.3])                                 # a world joint with no 2D joint is ignored
+    assert "r_foot_index" not in parse_keypoints(text(world=extra))[4].keypoints
+    for bad in ({"tail": [0, 0, 0]}, {"l_hip": [9.0, 0, 0]}, {"l_hip": [0, 0]}, {"l_hip": ["a", 0, 0]}, [1, 2, 3]):
+        try:
+            parse_keypoints(text(world=bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted world {bad!r}")
+    assert len(text()) < 4096                                                         # inside the server's text-message limit
+
+
+def _hold_standby(p, pose, seconds=2.0, start=0.0):
+    for i in range(round(seconds * FPS)):
+        p.process(pose, start + i / FPS)
+
+
+def test_rest_is_calibrated_from_the_posture_held_in_standby():
+    seated = _pose(240, 0, seated=True)                                        # a hip at 90 degrees, not the table's 170
+    p = Pipeline("Hip Flexion")
+    p.counting = False                                                         # READY: nothing is counted yet
+    _hold_standby(p, seated)
+    assert p.calibrate() is True
+    for side in "LR":
+        limb = p.reps.limbs[side]
+        assert limb.calibrated and abs(limb.rest - 90) < 0.5 and abs(limb.peak - 30) < 0.5, (side, limb.snapshot())   # table range 60, flexion
+    assert p.reps.snapshot()["L"]["calibrated"] is True and p.reps.snapshot()["L"]["rest"] == round(p.reps.limbs["L"].rest, 1)
+    # and the counter now counts a seated sweep (90 -> 35 -> 90) that the standing table values can never complete
+    for t, a in _sine_angles([("l_hip", 90, 35)], cycles=3, period_s=3.0):
+        p.reps.update(a, t)
+    assert p.reps.snapshot()["L"]["reps"] == 3
+    table = RepCounter("Hip Flexion")
+    for t, a in _sine_angles([("l_hip", 90, 35)], cycles=3, period_s=3.0):
+        table.update(a, t)
+    assert table.snapshot()["L"]["reps"] == 0
+
+
+def test_calibration_keeps_the_table_values_when_standby_cannot_be_trusted():
+    from collections import deque
+
+    def prepared(exercise, angle_at, seconds=1.5, stale=0.0):
+        p = Pipeline(exercise)
+        p.counting = False
+        n = round(seconds * FPS) + 1
+        side = next(iter(p.reps.joints))
+        for s in p.reps.joints:                                                # every limb was seen the same way
+            p._cal[s] = deque((i / FPS, angle_at(i / FPS)) for i in range(n))
+        p._last_t = (n - 1) / FPS + stale
+        return p, side
+    trusted, side = prepared("Hip Flexion", lambda t: 90.0)
+    assert trusted.calibrate() is True and trusted.reps.limbs[side].calibrated
+    cases = {
+        "the angle was moving about": prepared("Hip Flexion", lambda t: 90 + 30 * math.sin(6 * t)),
+        "too few samples": prepared("Hip Flexion", lambda t: 90.0, seconds=0.2),
+        "the person left the view": prepared("Hip Flexion", lambda t: 90.0, stale=1.0),
+        "no room between rest and peak (already standing)": prepared("Sit-to-Stand", lambda t: 170.0),
+    }
+    for why, (p, side) in cases.items():
+        assert p.calibrate() is False, why
+        limb = p.reps.limbs[side]
+        assert not limb.calibrated and (limb.rest, limb.peak) == limb.table, why
+    empty = Pipeline("Elbow Curl")
+    empty.counting = False
+    assert empty.calibrate() is False and not any(l.calibrated for l in empty.reps.limbs.values())    # nothing seen at all
+
+
+def test_one_side_is_never_calibrated_alone():
+    from collections import deque
+    n = round(1.5 * FPS) + 1
+
+    def prepared(left, right):
+        p = Pipeline("Elbow Curl")
+        p.counting = False
+        for side, angle in (("L", left), ("R", right)):
+            if angle is not None:
+                p._cal[side] = deque((i / FPS, angle) for i in range(n))
+        p._last_t = (n - 1) / FPS
+        return p
+    both = prepared(120, 110)                                                  # an arm resting well away from the standing 160
+    assert both.calibrate() is True and all(l.calibrated for l in both.reps.limbs.values())
+    for why, p in {"right side not seen": prepared(120, None), "sides disagree": prepared(160, 100),
+                   "standing posture (near the table)": prepared(158, 150)}.items():
+        assert p.calibrate() is False, why
+        assert all(not l.calibrated and (l.rest, l.peak) == l.table for l in p.reps.limbs.values()), why   # table for BOTH sides
+
+
+def test_phase_a_switches_can_each_be_turned_off_from_the_environment():
+    import os
+    names = ("ANGLES_3D", "CALIBRATE", "SMOOTH_TAU_S")
+    saved = {n: os.environ.get(n) for n in names}
+    try:
+        p = Pipeline("Hip Flexion")
+        assert p.angles_3d and p.calibrating and p.ema.tau        # on by default (unless the developer's .env says otherwise)
+        os.environ.update(ANGLES_3D="0", CALIBRATE="0", SMOOTH_TAU_S="0")
+        p = Pipeline("Hip Flexion")
+        assert not p.angles_3d and not p.calibrating and p.ema.tau is None
+        p.counting = False
+        _hold_standby(p, _pose(240, 0, seated=True))
+        assert p.calibrate() is False and not any(l.calibrated for l in p.reps.limbs.values())
+    finally:
+        for n, v in saved.items():
+            os.environ.pop(n, None) if v is None else os.environ.__setitem__(n, v)
+
+
+def test_a_phone_session_calibrates_when_it_starts_counting_but_a_desktop_session_does_not():
+    seated = _pose(240, 0, seated=True)
+    s = Session("phone", "Hip Flexion", standby=True)
+    for i in range(round(2 * FPS)):
+        s.process(seated, i / FPS)
+    assert not s.pipeline.counting
+    s.request_start()
+    assert not any(l.calibrated for l in s.pipeline.reps.limbs.values())       # still only a flag until the feeder applies it
+    s.apply_pending()
+    s.process(seated, 2.1)
+    reps = s.telemetry()["reps"]
+    assert s.pipeline.counting and reps["L"]["calibrated"] is True and abs(reps["L"]["rest"] - 90) < 0.5 and reps["L"]["reps"] == 0
+    desk = Session("desk", "Hip Flexion")                                       # counts from the start: there is no standby to learn from
+    for i in range(round(2 * FPS)):
+        desk.process(seated, i / FPS)
+    desk.request_start()
+    desk.apply_pending()
+    desk.process(seated, 2.1)
+    assert desk.telemetry()["reps"]["L"]["calibrated"] is False and desk.telemetry()["reps"]["L"]["rest"] == 170.0
+    other = Session("other", "Hip Flexion", standby=True)                       # the samples belong to the exercise they were taken for
+    for i in range(round(2 * FPS)):
+        other.process(seated, i / FPS)
+    other.request_exercise("Knee Flexion")
+    other.apply_pending()
+    assert other.pipeline._cal == {}
+
+
 def test_yolo_uses_fp16_only_on_a_gpu_and_the_engine_settings_come_from_the_environment():
     from app.engines.yolo_engine import YoloEngine
     assert YoloEngine(device="cuda:0").half is True                          # FP16 by default on the GPU

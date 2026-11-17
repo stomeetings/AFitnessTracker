@@ -29,10 +29,36 @@ DONE = 0.15                   # RETURNING completes the rep below DONE
 MIN_REP_S, MAX_REP_S = 0.4, 10.0
 
 
+# Calibration of `rest` from the person's own starting posture (see Pipeline.calibrate): the table's rest angles describe a
+# STANDING body, so someone seated or lying starts from a different angle and would never "return to rest".
+CAL_ANGLE_LO, CAL_ANGLE_HI = 15.0, 178.0   # an exercise's calibrated peak is kept inside what a joint can really do
+CAL_MIN_RANGE = 25.0                       # less than this between rest and peak is no exercise: keep the table values
+
+
+def calibrated_limits(rest_table: float, peak_table: float, measured_rest: float) -> tuple[float, float] | None:
+    """(rest, peak) for a person who starts at `measured_rest`: the table's range and direction, from their own rest. None when
+    that leaves too little room (e.g. a Sit-to-Stand measured while already standing), so the table values stay in use."""
+    direction = 1.0 if peak_table > rest_table else -1.0
+    peak = measured_rest + direction * abs(peak_table - rest_table)
+    peak = min(max(peak, CAL_ANGLE_LO), CAL_ANGLE_HI)
+    if abs(peak - measured_rest) < CAL_MIN_RANGE:
+        return None
+    return measured_rest, peak
+
+
 class LimbFSM:
     def __init__(self, rest: float, peak: float):
-        self.rest, self.peak = rest, peak
+        self.table = (rest, peak)               # the exercise's standing values
+        self.rest, self.peak = rest, peak       # in use: the table's, or calibrated ones
+        self.calibrated = False
         self.reset()
+
+    def set_limits(self, rest: float, peak: float, calibrated: bool = True) -> None:
+        self.rest, self.peak, self.calibrated = rest, peak, calibrated
+
+    def use_table(self) -> None:
+        self.rest, self.peak = self.table
+        self.calibrated = False
 
     def reset(self) -> None:
         self.state = IDLE
@@ -83,6 +109,7 @@ class LimbFSM:
             "reps": self.reps, "state": self.state,
             "angle": None if self.angle is None else round(self.angle, 1),
             "last_rom": round(self.last_rom, 1), "best_rom": round(self.best_rom, 1),
+            "rest": round(self.rest, 1), "peak": round(self.peak, 1), "calibrated": self.calibrated,
         }
 
 

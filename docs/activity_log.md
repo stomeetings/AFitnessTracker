@@ -905,6 +905,74 @@ On the phone it lagged badly, so it is gone and the on-device pipeline is back t
   `onnx`, `onnxruntime`, `onnxslim` (+ `protobuf`, `ml-dtypes`, `colorama`) installed for the export can be removed too.
 - Expected: 100 Python tests, 49 vitest.
 
+### Mobile performance & seated/bed tracking roadmap (2026-11-17) — strategy only, no code changed
+
+Saved as `docs/mobile-performance-roadmap.md`. Key findings from the code: phone poses arrive 2D only (world landmarks are not
+sent, so angles depend on the camera angle); rep `rest`/`peak` thresholds assume a standing body; one hidden joint (often the hip
+or ankle when seated) switches an angle off; per-frame EMA smoothing lags more on slow phones; and the fall detector's "flat body"
+cue would raise an alarm for anyone lying in bed for 5 s. Recommended order: 3D world landmarks, standby rest calibration and
+time-based smoothing first; then 640x480 camera input and fewer re-renders; posture profiles with physio review; bed fall logic
+only with sign-off; Capacitor native only when background fall monitoring is required.
+
+### Roadmap Phase A items 1, 2 and 5: 3D world landmarks, standby calibration, time-based smoothing (2026-11-17) — implemented, NOT yet run
+
+- **A1, world landmarks.** The phone sends MediaPipe's metric 3D `worldLandmarks` in the `kp` message (`"world":{joint:[x,y,z]}` in
+  metres from the hip centre, 3 decimals; `worldToJoints`, `keypointMessage`), `parse_keypoints` validates them (known joints, finite,
+  within 3 m) and attaches them to `Keypoint.world`, and `joint_angles` (which already preferred 3D when every joint of an angle has it)
+  now measures phone poses in 3D, so a knee bending toward the camera is no longer flat in the image. Optional on the wire (older
+  clients unchanged); `to_reference` already preserved `world`.
+- **A2, rest calibration.** While counting is off (READY) the pipeline keeps the last 1.5 s of each limb's exercise-joint angle. On
+  standby -> counting (`Session.apply_pending`, after the reset) `Pipeline.calibrate()` sets each limb's `rest` to the MEDIAN of that
+  window and its `peak` to rest +/- the table's range, in the table's direction (`rep_counter.calibrated_limits`, peak kept within
+  15..178 degrees). It keeps the table's standing values for any limb whose standby cannot be trusted: fewer than 8 samples or under
+  0.8 s of them, newest sample older than 0.5 s (person left the view), angle moved more than 20 degrees, or less than 25 degrees
+  between rest and peak (e.g. Sit-to-Stand measured while already standing). The desktop session counts from the start, so it has no
+  standby and is never calibrated (unchanged). Limb telemetry gains `rest`, `peak`, `calibrated`; the HUD shows "calibrated rest 92°"
+  while ACTIVE.
+- **A5, time-based smoothing.** `EMA(tau=0.08)` with `alpha = 1 - exp(-dt / tau)` replaces the per-frame 0.35 in the pipeline (0.08 s is
+  what 0.35 amounted to at 30 fps, so desktop behaviour is about the same); `EMA(alpha)` still works for fixed use. A slow phone now
+  reacts over the same time as a fast one.
+- **Known limit of A2:** the peak keeps the table's range. For an exercise whose seated range of motion is smaller (e.g. Hip Flexion
+  starting at 90 degrees), the peak may not be reachable and reps would still not complete; the table needs seated variants (roadmap A3)
+  with a physiotherapist's angles.
+- Tests: +6 Python (time-based smoothing, 3D angles, world in messages, calibration, calibration guards, session wiring) -> 106
+  expected; +3 vitest -> 52 expected.
+
+### Bug report: phone counts the left arm only after Phase A (2026-11-17) — calibration made all-or-nothing
+
+- **Investigated, no asymmetry found in:** coordinate mirroring (nothing in `landmarksToKeypoints`/`worldToJoints` flips or swaps
+  sides; the index table maps 11/13/15 to `l_*` and 12/14/16 to `r_*` for 2D and 3D alike, and a mirror would not change an angle
+  anyway), the world-landmark parsing (`parse_keypoints` is side-blind) and `joint_angles` (the same triples for both sides, 3D only
+  when all three joints have it, per side). The phone-only difference is the new standby calibration, which desktop "Server camera"
+  sessions never run.
+- **Most likely cause (not reproduced here, no phone data):** `Pipeline.calibrate()` decided PER LIMB. If one arm was measured and the
+  other was not (out of the frame, moving, held at a odd angle), the first counted against the person's baseline and the other
+  against the standing table, so one arm counted and the other never did.
+- **Fix:** for two-sided exercises calibration is all-or-nothing: if either limb cannot be measured or the two measured rests differ
+  by more than 30 degrees (`CAL_SIDE_DIFF_DEG`), BOTH keep the table values. Tests: +1 Python (`test_one_side_is_never_calibrated_alone`),
+  calibration-guard test now fills every limb.
+- **If it still happens:** the HUD pill and `reps.L/R` telemetry (`rest`, `peak`, `calibrated`, `angle`) show what each side measured;
+  a right `angle` of null means the right joints are below 0.5 confidence in the phone's framing.
+
+### Follow-up: standing worse on the phone after Phase A (2026-11-17)
+
+- Cause (likely): calibrating a STANDING person moved `rest`/`peak` by sensor noise (e.g. elbow 160 -> 150 pulls the peak from 50 to 40,
+  harder to reach). Fix: calibrate only when the measured rest differs from the table's by 25 degrees or more (`CAL_MIN_SHIFT_DEG`);
+  standing keeps the table values exactly as on the laptop. Seated/lying still calibrate.
+- New switch `ANGLES_3D=0` (backend/.env) measures angles in 2D again, to tell whether the phone's 3D world landmarks are what hurts
+  standing; default is 3D on. Test `test_one_side_is_never_calibrated_alone` extended with the standing case.
+
+### Bug report: high-end phone worse after Phase A; `ANGLES_3D=0` had no effect (2026-11-17)
+
+- **Found:** `ANGLES_3D` was read with `os.getenv`, but nothing loads `backend/.env` into the process environment, so the earlier
+  `ANGLES_3D=0` test changed nothing. The switches now go through `app/voice/settings.get` (environment, then `backend/.env`), read
+  when a session starts (reload the phone page, no backend restart needed): `ANGLES_3D=0` (2D angles), `SMOOTH_TAU_S=0` (the old fixed
+  per-frame alpha 0.35), `CALIBRATE=0` (table rest/peak). All three off = the pre-Phase-A pipeline. Test added.
+- **Reviewed for frame rate, no defect found:** the phone loop is capped at 30 fps (a 60 fps phone still sends 30), timestamps are the
+  phone's `performance.now()` and strictly increasing, `alpha = 1 - exp(-dt/tau)` is correct at any dt (at 30 fps 0.29 vs the old 0.35),
+  calibration samples by time (1.5 s window), keypoint replies are rate-limited to 10/s and only the newest waiting frame per session is
+  processed. So the fast phone is to be bisected with the three switches rather than guessed at.
+
 ### Next: P2 persistence and upload mode
 
 SQLite + JSON report, recording mode A/B, H.264 recorder via imageio-ffmpeg, upload job worker process, session history with Recharts.
