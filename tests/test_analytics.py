@@ -9,12 +9,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from app.engines import BBox, Keypoint, PoseResult  # noqa: E402
+from app.engines import BBox, Keypoint, PoseEngine, PoseResult  # noqa: E402
+from app.inference import InferenceService  # noqa: E402
 from app.pipeline.core import Pipeline  # noqa: E402
 from app.pipeline.escalation import ACKNOWLEDGED, ALERTED, COUNTDOWN, IDLE  # noqa: E402
 from app.pipeline.fall_detector import CONFIRMED, NORMAL, SUSPECTED, FallDetector  # noqa: E402
 from app.pipeline.kinematics import EMA, angle_deg, joint_angles  # noqa: E402
 from app.pipeline.rep_counter import RepCounter  # noqa: E402
+from app.sessions import EXERCISE_NAMES, Session, SessionLimitError, SessionManager, to_reference  # noqa: E402
 from app.voice.intent import classify, parse_intent  # noqa: E402
 import os  # noqa: E402
 
@@ -1013,6 +1015,1058 @@ def test_test_fall_simulation_unchanged_and_never_rechecks():
     assert seen == [ACKNOWLEDGED, IDLE], seen
     t, alert, seen, fired = _hold(p, t, STANDING, 130.0)
     assert seen == [IDLE] and fired == 0, seen
+
+
+class _FakeVoice:
+    """Stands in for VoiceListener: records what the session asks of it."""
+    def __init__(self):
+        self.active, self.started, self.stopped, self.quit_called = False, 0, 0, False
+        self.status, self.error = "idle", None
+
+    def start(self):
+        self.started += 1
+        self.active = True
+
+    def stop(self):
+        self.stopped += 1
+        self.active = False
+
+    def quit(self):
+        self.quit_called = True
+
+    def snapshot(self):
+        return {"status": self.status, "transcript": "", "intent": None, "error": None, "warning": None}
+
+
+def test_sessions_do_not_share_pipeline_state():
+    a, b = Session("a"), Session("b")
+    for i in range(1, int(5.5 * FPS) + 1):             # a lies flat on the floor through the 5 s dwell; b just stands
+        a.process(FLOOR, i / FPS)
+        b.process(STANDING, i / FPS)
+    assert a.telemetry()["fall"]["alert"]["state"] == "COUNTDOWN", a.telemetry()["fall"]
+    assert b.telemetry()["fall"]["alert"]["state"] == "IDLE" and b.telemetry()["fall"]["status"] == "NORMAL"
+    a.ack()                                             # answering a's countdown does not touch b
+    a.process(FLOOR, 6.0)
+    b.process(STANDING, 6.0)
+    assert a.telemetry()["fall"]["alert"]["state"] == "ACKNOWLEDGED"
+    assert b.telemetry()["fall"]["alert"]["state"] == "IDLE"
+    a.request_exercise("Knee Flexion")                  # nor does changing a's exercise
+    a.apply_pending()
+    assert a.pipeline.exercise == "Knee Flexion" and b.pipeline.exercise == EXERCISE_NAMES[0]
+    assert a.pipeline is not b.pipeline and a.pipeline.escalation is not b.pipeline.escalation
+
+
+def test_session_commands_only_set_flags_until_the_feeder_applies_them():
+    s = Session("s")
+    assert s.pipeline.exercise == "Elbow Curl"
+    s.request_exercise("Hip Flexion")
+    assert s.pipeline.exercise == "Elbow Curl" and s.pending_exercise == "Hip Flexion"   # a flag, nothing applied yet
+    s.apply_pending()
+    assert s.pipeline.exercise == "Hip Flexion" and s.pending_exercise is None
+    try:
+        s.request_exercise("Nope")
+    except ValueError as e:
+        assert "exercise must be one of" in str(e) and s.pending_exercise is None
+    else:
+        raise AssertionError("an unknown exercise must be refused")
+    s.pipeline.reps.limbs["L"].reps = 3
+    s.request_reset()
+    assert s.pipeline.reps.snapshot()["L"]["reps"] == 3 and s.pending_reset              # still only a flag
+    s.apply_pending()
+    assert s.pipeline.reps.snapshot()["L"]["reps"] == 0 and not s.pending_reset
+    try:
+        Session("bad", "Nope")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a session cannot start on an unknown exercise")
+
+
+def test_session_voice_follows_the_fall_dialog():
+    s = Session("s")
+    s.voice = _FakeVoice()
+    assert s.listen() == {"status": "idle", "error": None} and s.voice.started == 0      # no fall check: no microphone
+    s.simulate_fall()
+    s.process(STANDING, 0.1)
+    assert s.telemetry()["fall"]["alert"]["state"] == "COUNTDOWN" and "voice" in s.telemetry()["fall"]
+    s.listen()                                                                           # the dialog's prompt has ended
+    assert s.voice.started == 1 and s.voice.active
+    s.process(STANDING, 0.2)
+    assert s.voice.stopped == 0                                                          # dialog still open: keep listening
+    s.ack()
+    s.process(STANDING, 0.3)
+    assert s.telemetry()["fall"]["alert"]["state"] == "ACKNOWLEDGED"
+    assert s.voice.stopped == 1 and not s.voice.active                                   # dialog gone: microphone closed
+    quiet = Session("no voice")                                                          # browser-voice sessions have none
+    quiet.process(STANDING, 0.1)
+    assert "voice" not in quiet.telemetry()["fall"]
+    assert quiet.listen()["status"] == "unavailable"
+
+
+def test_session_manager_lifecycle():
+    m = SessionManager(max_sessions=3)
+    a, b = m.create("a"), m.create()                    # an id is generated when none is given
+    assert len(m) == 2 and m.get("a") is a and b.id in m and a.id != b.id and m.get("missing") is None
+    for call in (lambda: m.create("a"), lambda: m.create("x", exercise="Nope")):
+        try:
+            call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a duplicate id or an unknown exercise must be refused")
+    assert "x" not in m and len(m) == 2                 # a refused session is never registered
+    c = m.create("c")
+    try:
+        m.create("d")
+    except SessionLimitError:
+        pass
+    else:
+        raise AssertionError("the limit must be enforced")
+    a.voice = _FakeVoice()
+    assert m.close("a") is True and a.closed and a.voice.quit_called and "a" not in m
+    assert m.close("a") is False                        # closing twice is harmless
+    a.close()
+    m.create("d")                                       # room again
+    assert sorted(m.ids()) == sorted([b.id, "c", "d"])
+    m.close_all()
+    assert len(m) == 0 and b.closed and c.closed
+
+
+def _scaled(res, k):
+    return PoseResult({n: Keypoint(p.x * k, p.y * k, p.conf) for n, p in res.keypoints.items()},
+                      BBox(res.bbox.x * k, res.bbox.y * k, res.bbox.w * k, res.bbox.h * k, res.bbox.conf), res.timestamp_ms)
+
+
+def test_to_reference_scales_pose_to_the_640_wide_frame():
+    res = _pose(240, 0)
+    assert to_reference(res, 640) is res and to_reference(None, 1280) is None and to_reference(res, 0) is res
+    big = to_reference(res, 1280)
+    src, out = res.keypoints["l_hip"], big.keypoints["l_hip"]
+    assert (out.x, out.y, out.conf) == (src.x / 2, src.y / 2, src.conf)
+    assert (big.bbox.x, big.bbox.y, big.bbox.w, big.bbox.h) == (res.bbox.x / 2, res.bbox.y / 2, res.bbox.w / 2, res.bbox.h / 2)
+    assert big.bbox.conf == res.bbox.conf and big.timestamp_ms == res.timestamp_ms
+    assert res.keypoints["l_hip"].x == src.x            # the input is not modified
+    for width in (320, 1280):                           # a phone's frame size must not change the verdict
+        plain, phone = Session("plain"), Session("phone")
+        for i in range(1, int(5.5 * FPS) + 1):
+            plain.process(FLOOR, i / FPS)
+            phone.process(_scaled(FLOOR, width / 640), i / FPS, frame_width=width)
+        assert phone.telemetry()["fall"] == plain.telemetry()["fall"], width
+        assert phone.telemetry()["fall"]["alert"]["state"] == "COUNTDOWN"
+
+
+def test_desktop_routes_still_work_through_the_session():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    client = TestClient(main.app)                       # no `with`: the lifespan (camera, engine, microphone) never starts
+    s = main.local_session
+    assert main.sessions.get("local") is s and main.worker.session is s
+    assert client.get("/api/exercises").json() == EXERCISE_NAMES
+    info = client.get("/api/exercise_info").json()
+    assert set(info) == set(EXERCISE_NAMES) and set(info["Elbow Curl"]) == {"rest", "peak", "sides"}
+    t = client.get("/api/telemetry").json()
+    for key in ("camera_index", "camera_backend", "camera_error", "engine", "device", "fps", "latency_ms", "timings",
+                "privacy", "pose_visible", "error", "exercise"):
+        assert key in t, key                            # every field the frontend reads is still there
+    assert client.get("/api/health").json()["status"] == "ok"
+    # exercise: refused with the same HTTP 400 and message as before, applied by the feeding thread
+    assert client.post("/api/config", json={"exercise": "Elbow Curl"}).status_code == 200
+    assert s.pending_exercise == "Elbow Curl"
+    bad = client.post("/api/config", json={"exercise": "Nope"})
+    assert bad.status_code == 400 and "exercise must be one of" in bad.json()["detail"]
+    assert client.post("/api/config", json={"engine": "nope"}).status_code == 400
+    assert client.post("/api/config", json={"privacy": True}).json()["privacy"] is False    # not confirmed until a blanked frame
+    client.post("/api/config", json={"privacy": False})
+    assert client.post("/api/reset").json() == {"ok": True} and s.pending_reset
+    s.apply_pending()                                   # what the camera thread does between frames
+    assert s.pipeline.exercise == "Elbow Curl" and not s.pending_reset
+    # the fall flow, through the routes
+    assert client.post("/api/fall/test").json() == {"ok": True}
+    s.process(_pose(240, 0), 1.0, infer_ms=12.3)
+    t = client.get("/api/telemetry").json()
+    assert t["fall"]["alert"]["state"] == "COUNTDOWN" and "voice" in t["fall"]
+    assert t["latency_ms"] == 12.3 and t["pose_visible"] is True
+    client.post("/api/fall/escalate")
+    s.process(_pose(240, 0), 1.1)
+    assert client.get("/api/telemetry").json()["fall"]["alert"]["state"] == "ALERTED"
+    client.post("/api/fall/ack")
+    s.process(_pose(240, 0), 1.2)
+    assert client.get("/api/telemetry").json()["fall"]["alert"]["state"] == "IDLE"
+    r = client.post("/api/fall/listen").json()         # no fall check open: the microphone is not started
+    assert r["ok"] is True and set(r) == {"ok", "status", "error"}
+
+
+import json  # noqa: E402
+import struct  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+def test_reference_scale_uses_the_long_side_so_portrait_and_landscape_agree():
+    res = _pose(240, 0)
+    landscape, portrait = to_reference(res, 1280, 960), to_reference(res, 960, 1280)
+    hip = res.keypoints["l_hip"].x
+    assert landscape.keypoints["l_hip"].x == portrait.keypoints["l_hip"].x == hip / 2
+    assert to_reference(res, 640, 480) is res and to_reference(res, 480, 640) is res    # already at the reference scale
+    a, b = Session("a"), Session("b")
+    for i in range(1, int(5.5 * FPS) + 1):
+        a.process(FLOOR, i / FPS, frame_width=640, frame_height=480)
+        b.process(_scaled(FLOOR, 1.0), i / FPS, frame_width=480, frame_height=640)      # a portrait frame: same scale
+    assert a.telemetry()["fall"] == b.telemetry()["fall"]
+
+
+def test_session_baseline_reset_is_a_flag_until_the_feeder_applies_it():
+    s = Session("s")
+    s.process(_pose(240, 0), 0.1)
+    assert len(s.pipeline.fall._hist) == 1
+    s.request_baseline_reset()
+    assert s.pending_baseline_reset and len(s.pipeline.fall._hist) == 1               # only a flag so far
+    s.apply_pending()
+    assert not s.pending_baseline_reset and len(s.pipeline.fall._hist) == 0
+
+
+# ---- Phase 2: multi-session inference ---------------------------------------------------------------------------
+
+FRAME_FLOOR, FRAME_STANDING, FRAME_NOBODY, FRAME_BAD = 0, 100, 200, 250    # pixel values the test engine reads as scenes
+
+
+def _frame(value, h=480, w=640):
+    import numpy as np
+    return np.full((h, w, 3), value, np.uint8)
+
+
+def _wait_until(predicate, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class _SceneEngine(PoseEngine):
+    """A pose engine for tests. The frame's pixel value picks the scene (FRAME_FLOOR / FRAME_STANDING / FRAME_NOBODY;
+    FRAME_BAD raises) and the pose comes back in the frame's own pixel space, scaled by its long side, like a real one."""
+    name = "scene"
+
+    def __init__(self, stateless=True, gate=None):
+        self.stateless = stateless
+        self.gate = gate                    # an Event: until it is set, infer_batch blocks (the engine is "busy")
+        self.entered = threading.Event()
+        self.batches, self.seen, self.closed = [], [], False
+
+    def load(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def infer(self, frame, timestamp_ms):
+        value = int(frame[0, 0, 0])
+        self.seen.append(value)
+        if value > 225:
+            raise RuntimeError("bad frame")
+        if value > 150:
+            return None
+        return _scaled(FLOOR if value < 50 else _pose(240, 0), max(frame.shape[:2]) / 640)
+
+    def infer_batch(self, frames, timestamps_ms):
+        self.batches.append(len(frames))
+        if self.gate is not None:
+            self.entered.set()
+            self.gate.wait(5.0)
+        if any(int(f[0, 0, 0]) > 225 for f in frames):
+            raise RuntimeError("bad frame in the batch")
+        return super().infer_batch(frames, timestamps_ms)
+
+
+class _EngineFactory:
+    """create_engine for InferenceService: hands out test engines and remembers them."""
+    def __init__(self, **engine_kwargs):
+        self.engine_kwargs, self.made, self.names = engine_kwargs, [], []
+
+    def __call__(self, name):
+        self.names.append(name)
+        if name == "broken":
+            raise RuntimeError("cannot load")
+        engine = _SceneEngine(**self.engine_kwargs)
+        self.made.append(engine)
+        return engine
+
+
+def _started_service(factory, engine_name="main", fallback=None, **kwargs):
+    service = InferenceService(factory, engine_name=engine_name, fallback_engine=fallback, **kwargs)
+    service.start()
+    assert service.wait_ready(5), "the inference service never became ready"
+    return service
+
+
+def test_inference_service_routes_each_frame_to_its_own_session():
+    factory = _EngineFactory()
+    service = _started_service(factory)
+    try:
+        a, b = Session("a"), Session("b")
+        for i in range(1, int(5.5 * FPS) + 1):
+            ra = service.infer(a, _frame(FRAME_FLOOR), i / FPS)         # a lies flat on the floor
+            rb = service.infer(b, _frame(FRAME_STANDING), i / FPS)      # b stands
+            assert ra.error is None and rb.error is None, (ra, rb)
+        assert a.telemetry()["fall"]["alert"]["state"] == "COUNTDOWN"
+        assert b.telemetry()["fall"]["alert"]["state"] == "IDLE" and b.telemetry()["fall"]["status"] == "NORMAL"
+        assert ra.pose is not None and rb.pose is not None             # the pose comes back too, for drawing
+        assert factory.names == ["main"] and len(factory.made) == 1    # one shared engine served both patients
+    finally:
+        service.stop()
+
+
+def test_waiting_sessions_are_batched_into_one_engine_call():
+    gate = threading.Event()
+    factory = _EngineFactory(gate=gate)
+    service = _started_service(factory)
+    try:
+        engine = factory.made[0]
+        patients = [Session(f"s{i}") for i in range(4)]
+        first = service.submit(patients[0], _frame(FRAME_STANDING), 0.1)
+        assert engine.entered.wait(5)                                   # the engine is busy with s0 ...
+        rest = [service.submit(s, _frame(FRAME_STANDING), 0.1) for s in patients[1:]]    # ... so these three wait
+        gate.set()
+        results = [f.result(5) for f in [first] + rest]
+        assert engine.batches == [1, 3], engine.batches                 # and then go through together
+        assert [r.batch_size for r in results] == [1, 3, 3, 3]
+        assert all(r.error is None and not r.dropped for r in results)
+        assert all(s.pose_visible for s in patients)                    # every session was fed its own pose
+        assert service.stats["batches"] == 2 and service.stats["frames"] == 4
+    finally:
+        service.stop()
+
+
+def test_a_batch_is_capped_and_the_rest_wait_their_turn():
+    gate = threading.Event()
+    factory = _EngineFactory(gate=gate)
+    service = _started_service(factory, max_batch=2)
+    try:
+        engine = factory.made[0]
+        patients = [Session(f"s{i}") for i in range(5)]
+        first = service.submit(patients[0], _frame(FRAME_STANDING), 0.1)
+        assert engine.entered.wait(5)
+        rest = [service.submit(s, _frame(FRAME_STANDING), 0.1) for s in patients[1:]]
+        gate.set()
+        for f in [first] + rest:
+            assert f.result(5).error is None
+        assert engine.batches == [1, 2, 2], engine.batches              # nobody is starved: all five were served
+    finally:
+        service.stop()
+
+
+def test_only_the_newest_waiting_frame_of_a_session_is_inferred():
+    gate = threading.Event()
+    factory = _EngineFactory(gate=gate)
+    service = _started_service(factory)
+    try:
+        engine = factory.made[0]
+        busy = service.submit(Session("busy"), _frame(FRAME_STANDING), 0.1)
+        assert engine.entered.wait(5)
+        s1 = Session("s1")
+        old = service.submit(s1, _frame(FRAME_FLOOR), 0.1)             # waits behind the engine ...
+        new = service.submit(s1, _frame(FRAME_STANDING), 0.2)          # ... and is replaced by a newer frame
+        gate.set()
+        assert old.result(5).dropped is True
+        result = new.result(5)
+        assert not result.dropped and result.error is None
+        busy.result(5)
+        assert engine.seen == [FRAME_STANDING, FRAME_STANDING]          # the floor frame never reached the engine
+        assert engine.batches == [1, 1] and service.stats["dropped"] == 1
+        assert s1.pose_visible and s1.telemetry()["fall"]["status"] == "NORMAL"
+    finally:
+        service.stop()
+
+
+def test_a_failing_frame_is_contained_to_its_own_session():
+    gate = threading.Event()
+    factory = _EngineFactory(gate=gate)
+    service = _started_service(factory)
+    try:
+        engine = factory.made[0]
+        busy = service.submit(Session("busy"), _frame(FRAME_STANDING), 0.1)
+        assert engine.entered.wait(5)
+        a, b = Session("a"), Session("b")
+        fa = service.submit(a, _frame(FRAME_BAD), 0.1)
+        fb = service.submit(b, _frame(FRAME_STANDING), 0.1)
+        gate.set()
+        busy.result(5)
+        ra, rb = fa.result(5), fb.result(5)
+        assert engine.batches == [1, 2]                                 # one batch holding both; it failed as a whole
+        assert ra.error and "inference failed" in ra.error and ra.pose is None
+        assert rb.error is None and rb.pose is not None and rb.batch_size == 2     # b was retried alone and succeeded
+        assert not a.pose_visible and "fall" not in a.telemetry()       # a was NOT fed a made-up "nobody in view"
+        assert b.telemetry()["fall"]["status"] == "NORMAL"
+    finally:
+        service.stop()
+
+
+def test_a_stateful_engine_gets_one_instance_per_session():
+    factory = _EngineFactory(stateless=False)
+    service = _started_service(factory)
+    try:
+        a, b = Session("a"), Session("b")
+        service.infer(a, _frame(FRAME_STANDING), 0.1)
+        service.infer(b, _frame(FRAME_STANDING), 0.1)
+        service.infer(a, _frame(FRAME_STANDING), 0.2)
+        assert len(factory.made) == 2                                   # the load-time instance became a's; b got its own
+        assert sorted(len(e.seen) for e in factory.made) == [1, 2]      # no frame of one patient reached the other's engine
+        owner_of_a = next(e for e in factory.made if len(e.seen) == 2)
+        service.forget("a")
+        assert _wait_until(lambda: owner_of_a.closed)                   # a's engine is released with the session
+        assert not any(e.closed for e in factory.made if e is not owner_of_a)
+    finally:
+        service.stop()
+
+
+def test_engine_switch_happens_between_batches_and_a_failed_switch_changes_nothing():
+    factory = _EngineFactory()
+    service = _started_service(factory)
+    try:
+        assert service.engine_name == "main"
+        service.request_engine("other")
+        assert _wait_until(lambda: service.engine_name == "other")
+        assert factory.names == ["main", "other"] and factory.made[0].closed and not factory.made[1].closed
+        service.request_engine("broken")
+        assert _wait_until(lambda: factory.names[-1] == "broken")
+        time.sleep(0.2)
+        assert service.engine_name == "other" and not factory.made[1].closed     # the failed switch changed nothing
+        assert service.infer(Session("a"), _frame(FRAME_STANDING), 0.1).error is None      # and it still serves
+    finally:
+        service.stop()
+
+
+def test_the_service_falls_back_when_the_default_engine_will_not_load():
+    factory = _EngineFactory()
+    service = _started_service(factory, engine_name="broken", fallback="mediapipe")
+    try:
+        assert service.engine_name == "mediapipe" and factory.names == ["broken", "mediapipe"]
+        assert service.infer(Session("a"), _frame(FRAME_STANDING), 0.1).error is None
+    finally:
+        service.stop()
+    nothing = _started_service(_EngineFactory(), engine_name="broken", fallback="broken")
+    try:
+        s = Session("s")
+        r = nothing.infer(s, _frame(FRAME_STANDING), 0.1)
+        assert r.error and "engine unavailable" in r.error and r.pose is None
+        assert not s.pose_visible and "fall" not in s.telemetry()       # with no engine a session is fed nothing
+    finally:
+        nothing.stop()
+
+
+def test_every_resolution_and_orientation_is_judged_at_the_same_reference_scale():
+    factory = _EngineFactory()
+    service = _started_service(factory)
+    shapes = [(480, 640), (960, 1280), (240, 320), (640, 480), (1280, 960)]     # (h, w): landscape 1x 2x 0.5x, portrait 1x 2x
+    try:
+        patients = [Session(f"s{i}") for i in range(len(shapes))]
+        frames = [_frame(FRAME_FLOOR, h, w) for h, w in shapes]
+        for i in range(1, int(5.5 * FPS) + 1):
+            for s, frame in zip(patients, frames):
+                assert service.infer(s, frame, i / FPS).error is None
+        reference = patients[0].telemetry()["fall"]
+        assert reference["alert"]["state"] == "COUNTDOWN"
+        for s, shape in zip(patients, shapes):
+            assert s.telemetry()["fall"] == reference, shape             # the same scene gives the same verdict everywhere
+    finally:
+        service.stop()
+
+
+def test_a_timed_out_frame_does_not_feed_the_session_a_made_up_empty_pose():
+    gate = threading.Event()
+    factory = _EngineFactory(gate=gate)
+    service = _started_service(factory)
+    try:
+        engine = factory.made[0]
+        busy = service.submit(Session("busy"), _frame(FRAME_STANDING), 0.1)
+        assert engine.entered.wait(5)
+        a = Session("a")
+        assert service.infer(a, _frame(FRAME_STANDING), 0.1, timeout=0.05) is None
+        assert not a.pose_visible and "fall" not in a.telemetry()       # nothing was fed
+        gate.set()
+        busy.result(5)
+        assert _wait_until(lambda: a.pose_visible)                      # the frame was only late, and is processed
+    finally:
+        service.stop()
+
+
+def test_the_service_applies_pending_commands_even_when_no_frames_arrive():
+    service = _started_service(_EngineFactory())
+    try:
+        s = Session("s")
+        service.infer(s, _frame(FRAME_STANDING), 0.1)                   # registers the session with the service
+        s.request_exercise("Hip Flexion")
+        s.request_baseline_reset()
+        assert _wait_until(lambda: s.pipeline.exercise == "Hip Flexion" and not s.pending_baseline_reset)
+        service.forget("s")                                             # no longer swept ...
+        time.sleep(0.3)
+        s.request_exercise("Elbow Curl")
+        time.sleep(0.3)
+        assert s.pending_exercise == "Elbow Curl"                       # ... so later commands stay pending
+    finally:
+        service.stop()
+
+
+def test_the_desktop_worker_feeds_the_local_session_through_the_service():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    assert main.worker.service is main.service and main.worker.session is main.local_session
+    assert main.service.engine_name == "yolo"                           # the default is unchanged
+    client = TestClient(main.app)
+    assert client.post("/api/config", json={"engine": "mediapipe"}).status_code == 200
+    try:
+        assert main.service._pending_engine == "mediapipe"              # requested; the service thread applies it
+        assert client.get("/api/telemetry").json()["engine"] == "yolo"  # and telemetry stays truthful until it has
+    finally:
+        main.service._pending_engine = None
+    try:                                                                 # (the router itself is tested with private apps)
+        with client.websocket_connect("/ws/session"):
+            pass
+    except Exception as e:  # noqa: BLE001
+        assert type(e).__name__ in ("WebSocketDisconnect", "WebSocketDenialResponse"), repr(e)
+    else:
+        assert main._remote_enabled(), "remote sessions must be off unless REMOTE_SESSIONS=1"
+
+
+def _remote_app(service, sessions, enabled=True, max_remote=4):
+    from fastapi import FastAPI
+    from app.remote import create_router
+    app = FastAPI()
+    app.include_router(create_router(sessions, service, enabled=lambda: enabled, max_remote=lambda: max_remote))
+    return app
+
+
+def _jpeg(value, h, w):
+    import cv2
+    import numpy as np
+    ok, buf = cv2.imencode(".jpg", np.full((h, w, 3), value, np.uint8))
+    assert ok
+    return buf.tobytes()
+
+
+def _wire(seq, capture_ms, jpeg):
+    return struct.pack(">Id", seq, capture_ms) + jpeg
+
+
+def test_a_remote_session_streams_frames_and_gets_telemetry_back():
+    from fastapi.testclient import TestClient
+    factory = _EngineFactory()
+    service = _started_service(factory)
+    sessions_ = SessionManager()
+    try:
+        client = TestClient(_remote_app(service, sessions_))
+        with client.websocket_connect("/ws/session") as ws:
+            hello = ws.receive_json()
+            assert hello["type"] == "hello" and hello["session"].startswith("remote-")
+            assert hello["reference_long_side"] == 640 and hello["exercises"] == EXERCISE_NAMES
+            sid = hello["session"]
+            assert sessions_.get(sid) is not None
+            for seq in range(1, 4):                                     # the floor scene, from a small 64 x 48 frame
+                ws.send_bytes(_wire(seq, seq * 100.0, _jpeg(FRAME_FLOOR, 48, 64)))
+                reply = ws.receive_json()
+                assert reply["type"] == "t" and reply["ack"] == seq and "error" not in reply, reply
+            assert reply["frame"] == {"w": 64, "h": 48} and reply["pose_visible"] is True
+            assert len(reply["pose"]["kp"]["l_hip"]) == 3 and len(reply["pose"]["bbox"]) == 4
+            assert reply["fall"]["status"] == "SUSPECTED"               # a 64 px frame was judged at the reference scale
+            ws.send_json({"type": "cmd", "name": "exercise", "value": "Knee Flexion"})
+            assert ws.receive_json() == {"type": "cmd_result", "name": "exercise", "ok": True}
+            ws.send_json({"type": "cmd", "name": "exercise", "value": "Nope"})
+            bad = ws.receive_json()
+            assert bad["ok"] is False and "exercise must be one of" in bad["error"]
+            ws.send_json({"type": "cmd", "name": "launch"})
+            assert ws.receive_json()["ok"] is False
+            ws.send_json({"type": "cmd", "name": "test_fall"})
+            assert ws.receive_json() == {"type": "cmd_result", "name": "test_fall", "ok": True}
+            ws.send_bytes(_wire(0, 0.0, b"this is not a jpeg"))
+            assert ws.receive_json()["error"] == "not a JPEG image"
+            ws.send_bytes(b"abc")
+            assert ws.receive_json()["error"] == "frame too short"
+            ws.send_bytes(_wire(9, 900.0, _jpeg(FRAME_STANDING, 48, 64)))
+            last = ws.receive_json()
+            assert last["ack"] == 9 and last["exercise"] == "Knee Flexion"   # the command was applied before this frame
+        assert _wait_until(lambda: sessions_.get(sid) is None)          # disconnecting closes the session
+    finally:
+        service.stop()
+
+
+def test_remote_sessions_are_refused_when_disabled_or_full():
+    from fastapi.testclient import TestClient
+    service = _started_service(_EngineFactory())
+    try:
+        def refused(client):
+            try:
+                with client.websocket_connect("/ws/session"):
+                    pass
+            except Exception as e:  # noqa: BLE001
+                assert type(e).__name__ in ("WebSocketDisconnect", "WebSocketDenialResponse"), repr(e)
+                return True
+            return False
+        assert refused(TestClient(_remote_app(service, SessionManager(), enabled=False)))
+        full = TestClient(_remote_app(service, SessionManager(), max_remote=1))
+        with full.websocket_connect("/ws/session") as first:
+            assert first.receive_json()["type"] == "hello"
+            assert refused(full)                                        # the second one is turned away
+    finally:
+        service.stop()
+
+
+# ---- Phase 4: access control for tunnels ------------------------------------------------------------------------
+
+def _refused_with(client, path="/ws/session", **kw):
+    """The close code (or None when the handshake itself was refused) of a socket the server turns away."""
+    try:
+        with client.websocket_connect(path, **kw) as ws:
+            ws.receive_json()
+    except Exception as e:  # noqa: BLE001
+        assert type(e).__name__ in ("WebSocketDisconnect", "WebSocketDenialResponse"), repr(e)
+        return getattr(e, "code", None) or 0
+    return None
+
+
+def test_token_origin_and_failure_limiter_basics():
+    from app.security import FailureLimiter, is_tunneled, origin_allowed, token_ok
+    assert token_ok("s3cret", "s3cret") and not token_ok("s3cret!", "s3cret") and not token_ok("", "s3cret")
+    assert origin_allowed(None, ["x"])                                        # no Origin: not a browser
+    assert origin_allowed("https://a.trycloudflare.com", ["a.trycloudflare.com"])
+    assert origin_allowed("https://a.trycloudflare.com/", ["", "A.trycloudflare.com"])
+    assert not origin_allowed("https://evil.example", ["a.trycloudflare.com"])
+    assert not origin_allowed("null", ["a.trycloudflare.com"])
+    assert origin_allowed("https://evil.example", ["a"], ["https://evil.example/"]) and origin_allowed("https://x.y", [], ["*"])
+    assert is_tunneled([(b"host", b"x"), (b"X-Forwarded-For", b"1.2.3.4")]) and not is_tunneled([(b"host", b"x")])
+    for local in (b"localhost:5173", b"127.0.0.1:8000", b"192.168.1.20:5173", b"[::1]:8000", b"my-laptop", b"pc.local", b"testserver"):
+        assert not is_tunneled([(b"host", local)]), local
+    for public in (b"abc.trycloudflare.com", b"x.ngrok-free.app:443", b"8.8.8.8:8000"):
+        assert is_tunneled([(b"host", public)]), public                     # no forwarding headers needed
+    now = [0.0]
+    lim = FailureLimiter(max_fails=2, window_s=60, clock=lambda: now[0])
+    lim.record(); assert not lim.blocked()
+    lim.record(); assert lim.blocked()
+    now[0] = 61.0
+    assert not lim.blocked()                                                   # the window passed
+
+
+def test_remote_gateway_requires_the_access_token_when_one_is_set():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.remote import create_router
+    from app.security import FailureLimiter
+    service = _started_service(_EngineFactory())
+    sessions_ = SessionManager()
+    try:
+        app = FastAPI()
+        app.include_router(create_router(sessions_, service, token=lambda: "s3cret", auth_timeout=0.3,
+                                         limiter=FailureLimiter(max_fails=2)))
+        client = TestClient(app)
+        with client.websocket_connect("/ws/session") as ws:                    # the right token
+            ws.send_json({"type": "auth", "token": "s3cret"})
+            assert ws.receive_json()["type"] == "hello" and len(sessions_) == 1
+            ws.send_json({"type": "auth", "token": "again"})                  # a stray auth message is ignored, not an error
+            ws.send_json({"type": "cmd", "name": "reset"})
+            assert ws.receive_json() == {"type": "cmd_result", "name": "reset", "ok": True}
+        assert _wait_until(lambda: len(sessions_) == 0)
+        assert _refused_with(client) == 4401                                   # silent: no token within auth_timeout
+        with client.websocket_connect("/ws/session") as ws:                    # wrong token, twice: counts as guessing
+            ws.send_json({"type": "auth", "token": "nope"})
+            try:
+                ws.receive_json()
+            except Exception as e:  # noqa: BLE001
+                assert getattr(e, "code", None) == 4401
+        with client.websocket_connect("/ws/session") as ws:
+            ws.send_json({"type": "auth", "token": "nope"})
+            try:
+                ws.receive_json()
+            except Exception as e:  # noqa: BLE001
+                assert getattr(e, "code", None) == 4401
+        with client.websocket_connect("/ws/session") as ws:                    # now locked out, even with the right token
+            ws.send_json({"type": "auth", "token": "s3cret"})
+            try:
+                ws.receive_json()
+            except Exception as e:  # noqa: BLE001
+                assert getattr(e, "code", None) == 1013
+            else:
+                raise AssertionError("a locked-out client must be refused")
+        assert len(sessions_) == 0                                             # no session was ever created for a refusal
+    finally:
+        service.stop()
+
+
+def test_remote_gateway_checks_the_browser_origin():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.remote import create_router
+    service = _started_service(_EngineFactory())
+    try:
+        def client(allowed=()):
+            app = FastAPI()
+            app.include_router(create_router(SessionManager(), service, allowed_origins=lambda: list(allowed)))
+            return TestClient(app)
+        assert _refused_with(client(), headers={"origin": "https://evil.example"}) is not None   # another site
+        with client().websocket_connect("/ws/session", headers={"origin": "http://testserver"}) as ws:     # this site
+            assert ws.receive_json()["type"] == "hello"
+        with client().websocket_connect("/ws/session", headers={"origin": "https://t.trycloudflare.com",    # via a proxy
+                                                                "x-forwarded-host": "t.trycloudflare.com"}) as ws:
+            assert ws.receive_json()["type"] == "hello"
+        with client(["https://other.example"]).websocket_connect("/ws/session", headers={"origin": "https://other.example"}) as ws:
+            assert ws.receive_json()["type"] == "hello"                       # listed in REMOTE_ALLOWED_ORIGINS
+    finally:
+        service.stop()
+
+
+def test_tunneled_requests_cannot_reach_the_desktop_routes():
+    from fastapi import FastAPI, WebSocket
+    from fastapi.testclient import TestClient
+    from app.security import TunnelGuard
+    app = FastAPI()
+    app.add_middleware(TunnelGuard)
+
+    @app.get("/api/video_feed")
+    def feed():
+        return {"camera": True}
+
+    @app.get("/api/exercises")
+    def exercises():
+        return ["a"]
+
+    @app.websocket("/ws/telemetry")
+    async def telemetry(ws: WebSocket):
+        await ws.accept()
+        await ws.send_json({"ok": True})
+
+    @app.get("/index.html")
+    def page():
+        return {"page": True}
+
+    client, via = TestClient(app), {"x-forwarded-for": "203.0.113.9"}
+    assert client.get("/api/video_feed").status_code == 200                 # directly (localhost / LAN): unchanged
+    assert client.get("/api/video_feed", headers=via).status_code == 403    # through a tunnel: refused
+    assert client.get("/api/exercises", headers=via).status_code == 200     # the harmless reads stay open
+    assert client.get("/index.html", headers=via).status_code == 200        # and so do the app's own files
+    assert client.get("/api/video_feed", headers={"cf-connecting-ip": "203.0.113.9"}).status_code == 403
+    assert _refused_with(client, "/ws/telemetry", headers=via) is not None
+    with client.websocket_connect("/ws/telemetry") as ws:
+        assert ws.receive_json() == {"ok": True}
+
+
+def test_health_tells_a_tunnel_visitor_only_what_the_connect_screen_needs():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    client = TestClient(main.app)
+    direct = client.get("/api/health").json()
+    assert "camera_index" in direct                                          # the desktop page still gets everything
+    assert direct["remote_sessions"] is main._remote_enabled() and direct["remote_auth"] is bool(main._remote_token())
+    tunneled = client.get("/api/health", headers={"x-forwarded-for": "203.0.113.9"}).json()
+    assert set(tunneled) == {"status", "remote_sessions", "remote_auth"}
+    assert client.post("/api/fall/test", headers={"x-forwarded-for": "203.0.113.9"}).status_code == 403
+    assert client.get("/api/video_feed", headers={"x-forwarded-for": "203.0.113.9"}).status_code == 403
+
+
+# ---- browser voice: session commands and the audio message ------------------------------------------------------
+
+def test_session_commands_are_understood_loosely_but_never_by_accident():
+    from app.voice.intent import classify_command as c
+    for text in ("Start my session.", "start session", "Begin my session", "start the sesion please", "resume session",
+                 "Let's go!", "lets go", "okay, let us go", "LET’S GO"):
+        assert c(text) == "start_session", text
+    for text in ("Stop session", "stop the session please", "End my session.", "stop sessions", "finish session"):
+        assert c(text) == "stop_session", text
+    for text in ("Show preview", "display preview", "Display the preview.", "open preview", "show pre view", "start preview"):
+        assert c(text) == "show_preview", text
+    for text in ("Hide preview.", "hide the preview", "close preview", "stop preview"):
+        assert c(text) == "hide_preview", text
+    for text in ("", "start", "stop", "preview", "session", "I am okay", "show me the weather", "don't stop the session",
+                 "stop and start the session", "show and hide preview", "start the preview session", "help",
+                 "let it go", "let's not go", "let me know when we can go outside and have a long walk"):
+        assert c(text) is None, text
+
+
+def test_transcribe_names_the_audio_format_it_is_given():
+    from app.voice import groq_stt
+    seen = {}
+
+    class R:
+        status_code = 200
+        def json(self): return {"text": "start my session"}
+
+    def post(url, **kw):
+        seen.update(kw)
+        return R()
+    assert groq_stt.transcribe(b"x", "k", post=post, filename="speech.webm", content_type="audio/webm") == "start my session"
+    assert seen["files"]["file"] == ("speech.webm", b"x", "audio/webm")
+    groq_stt.transcribe(b"x", "k", post=post)                                  # the microphone path is unchanged
+    assert seen["files"]["file"][0] == "speech.wav"
+
+
+def _audio(mime="audio/webm;codecs=opus", payload=b"\x1aE\xdf\xa3" * 300):
+    import base64
+    return json.dumps({"type": "audio", "mime": mime, "data": base64.b64encode(payload).decode()}, separators=(",", ":"))
+
+
+def test_remote_voice_runs_session_commands_and_the_fall_answers():
+    from fastapi.testclient import TestClient
+    from app.voice import groq_stt
+    service = _started_service(_EngineFactory())
+    sessions_ = SessionManager()
+    said, sent = ["start my session"], {}
+    real_t, real_k = groq_stt.transcribe, groq_stt.api_key
+    groq_stt.api_key = lambda env_file=None: "k"
+
+    def fake(audio, key, post=None, filename="speech.wav", content_type="audio/wav"):
+        sent.update(audio=audio, filename=filename, content_type=content_type)
+        return said[0]
+    groq_stt.transcribe = fake
+    try:
+        client = TestClient(_remote_app(service, sessions_))
+        with client.websocket_connect("/ws/session") as ws:
+            ws.receive_json()                                                  # hello
+            ws.send_text(_audio("audio/webm;codecs=opus"))
+            assert ws.receive_json() == {"type": "voice", "ok": True, "text": "start my session", "intent": "start_session"}
+            assert sent["filename"] == "speech.webm" and sent["content_type"] == "audio/webm" and len(sent["audio"]) == 1200
+            for words, intent in (("Hide preview", "hide_preview"), ("show the preview", "show_preview"),
+                                  ("stop session", "stop_session"), ("what a nice day", None)):
+                said[0] = words
+                ws.send_text(_audio("audio/mp4"))
+                reply = ws.receive_json()
+                assert reply["intent"] == intent and sent["filename"] == "speech.m4a", reply
+            said[0] = "I am fine"                                              # no fall check open: only commands count
+            ws.send_text(_audio())
+            assert ws.receive_json()["intent"] is None
+            ws.send_json({"type": "cmd", "name": "test_fall"})                 # now a fall check opens
+            assert ws.receive_json()["ok"] is True
+            for seq in range(1, 60):
+                ws.send_bytes(_wire(seq, seq * 100.0, _jpeg(FRAME_STANDING, 48, 64)))
+                reply = ws.receive_json()
+                if reply["fall"]["alert"]["state"] == "COUNTDOWN":
+                    break
+            else:
+                raise AssertionError("the simulated fall never opened the countdown")
+            said[0] = "start my session"                                       # commands are off while the dialog is open
+            ws.send_text(_audio())
+            assert ws.receive_json()["intent"] is None
+            said[0] = "I am fine"
+            ws.send_text(_audio())
+            assert ws.receive_json()["intent"] == "ok"
+            said[0] = "help"
+            ws.send_text(_audio())
+            assert ws.receive_json()["intent"] == "help"
+    finally:
+        groq_stt.transcribe, groq_stt.api_key = real_t, real_k
+        service.stop()
+
+
+def test_remote_voice_rejects_bad_audio_and_missing_keys_and_flooding():
+    from fastapi.testclient import TestClient
+    import app.remote as remote
+    import app.voicecmd as voicecmd
+    from app.voice import groq_stt
+    service = _started_service(_EngineFactory())
+    real_t, real_k, real_cap = groq_stt.transcribe, groq_stt.api_key, voicecmd.VOICE_PER_MIN
+    calls = []
+    groq_stt.transcribe = lambda *a, **k: calls.append(1) or "stop session"
+    try:
+        client = TestClient(_remote_app(service, SessionManager()))
+        with client.websocket_connect("/ws/session") as ws:
+            ws.receive_json()
+            groq_stt.api_key = lambda env_file=None: None
+            ws.send_text(_audio())
+            assert ws.receive_json()["status"] == "unavailable"                # no GROQ_API_KEY on the server
+            groq_stt.api_key = lambda env_file=None: "k"
+            ws.send_text(_audio("video/x-matroska"))
+            assert "unsupported audio type" in ws.receive_json()["error"]
+            ws.send_text('{"type":"audio","mime":"audio/webm","data":"!!not base64!!"}')
+            assert ws.receive_json()["error"] == "bad audio message"
+            ws.send_text(_audio(payload=b"x" * (remote.MAX_AUDIO_BYTES + 1)))
+            assert ws.receive_json()["error"] == "audio too large"
+            assert calls == []                                                 # none of those reached Groq
+            voicecmd.VOICE_PER_MIN = 2
+            for _ in range(2):
+                ws.send_text(_audio())
+                assert ws.receive_json()["ok"] is True
+            ws.send_text(_audio())
+            assert "rate limit" in ws.receive_json()["error"] and len(calls) == 2
+            groq_stt.transcribe = lambda *a, **k: (_ for _ in ()).throw(groq_stt.SttError("Groq rate limit reached"))
+            voicecmd.VOICE_PER_MIN = 99
+            ws.send_text(_audio())
+            assert ws.receive_json()["error"] == "Groq rate limit reached"
+            ws.send_json({"type": "cmd", "name": "reset"})                     # the socket is still healthy afterwards
+            assert ws.receive_json()["ok"] is True
+    finally:
+        groq_stt.transcribe, groq_stt.api_key, voicecmd.VOICE_PER_MIN = real_t, real_k, real_cap
+        service.stop()
+
+
+def test_standby_pauses_rep_counting_but_never_the_fall_detector():
+    assert Session("d").telemetry()["counting"] is True                      # the desktop session counts from the start, as before
+    s = Session("s", standby=True)
+    calls = []
+    real = s.pipeline.reps.update
+    s.pipeline.reps.update = lambda angles, t: (calls.append(t), real(angles, t))[1]
+    for i in range(10):
+        s.process(_pose(240, 0), i / FPS)
+    assert calls == [] and s.telemetry()["counting"] is False               # standing in frame, nothing scored
+    for i in range(1, int(5.5 * FPS) + 1):                                   # a fall while still in standby ...
+        s.process(FLOOR, 1.0 + i / FPS)
+    assert s.telemetry()["fall"]["alert"]["state"] == "COUNTDOWN"            # ... is still detected
+    s.pending_reset = False
+    s.request_start()
+    assert s.pipeline.counting is False and s.pending_counting is True       # only a flag until the feeder applies it
+    s.apply_pending()
+    assert s.pipeline.counting is True and s.pending_counting is None and not s.pending_reset
+    s.process(_pose(240, 0), 20.0)
+    assert calls                                                              # counting now
+    s.request_stop()
+    s.apply_pending()
+    assert s.pipeline.counting is False and s.telemetry()["counting"] is False
+
+
+def test_a_phone_session_starts_in_standby_and_the_hud_commands_start_and_pause_it():
+    from fastapi.testclient import TestClient
+    service = _started_service(_EngineFactory())
+    try:
+        client = TestClient(_remote_app(service, SessionManager()))
+        with client.websocket_connect("/ws/session") as ws:
+            ws.receive_json()
+            seq = [0]
+
+            def counting():
+                seq[0] += 1
+                ws.send_bytes(_wire(seq[0], seq[0] * 100.0, _jpeg(FRAME_STANDING, 48, 64)))
+                return ws.receive_json()["counting"]
+            assert counting() is False                                       # standby until told otherwise
+            ws.send_json({"type": "cmd", "name": "start_session"})
+            assert ws.receive_json() == {"type": "cmd_result", "name": "start_session", "ok": True}
+            assert _wait_until(lambda: counting() is True)
+            ws.send_json({"type": "cmd", "name": "stop_session"})
+            assert ws.receive_json()["ok"] is True
+            assert _wait_until(lambda: counting() is False)
+    finally:
+        service.stop()
+
+
+def test_the_desktop_session_buttons_start_and_pause_counting():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    client = TestClient(main.app)
+    assert client.post("/api/session/start").json() == {"ok": True}
+    assert main.local_session.pending_counting is True and main.local_session.pending_reset is True
+    assert client.post("/api/session/stop").json() == {"ok": True}
+    assert main.local_session.pending_counting is False
+    main.local_session.pending_counting, main.local_session.pending_reset = None, False
+    assert client.post("/api/session/start", headers={"x-forwarded-for": "203.0.113.9"}).status_code == 403   # desktop routes
+    assert main.local_session.pending_counting is None
+
+
+def test_yolo_uses_fp16_only_on_a_gpu_and_the_engine_settings_come_from_the_environment():
+    from app.engines.yolo_engine import YoloEngine
+    assert YoloEngine(device="cuda:0").half is True                          # FP16 by default on the GPU
+    assert YoloEngine(device="cuda:0", half=False).half is False
+    assert YoloEngine(device="cpu").half is False                            # the CPU has no half precision: never asked for
+    import app.main as main
+    saved = {k: os.environ.get(k) for k in ("YOLO_IMGSZ", "YOLO_HALF")}
+    try:
+        os.environ["YOLO_IMGSZ"], os.environ["YOLO_HALF"] = "640", "1"       # explicit, so a value in backend/.env cannot interfere
+        defaults = main._engine_kwargs("yolo")
+        assert defaults["device"] == "cuda:0" and defaults["half"] is True and defaults["imgsz"] == 640
+        os.environ["YOLO_IMGSZ"], os.environ["YOLO_HALF"] = "480", "off"
+        tuned = main._engine_kwargs("yolo")
+        assert tuned["imgsz"] == 480 and tuned["half"] is False
+        os.environ["YOLO_IMGSZ"] = "500"                                     # not a multiple of 32: ignored
+        assert main._engine_kwargs("yolo")["imgsz"] == 640
+        os.environ["YOLO_IMGSZ"] = "64"                                      # absurdly small: ignored
+        assert main._engine_kwargs("yolo")["imgsz"] == 640
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+    assert main._engine_kwargs("mediapipe") == {"variant": "full"}
+    assert main._engine_kwargs("mediapipe_lite") == {"variant": "lite"}      # selectable on the badge, never the default
+
+
+def test_the_lite_mediapipe_model_can_be_chosen_over_the_api_and_the_socket():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    assert list(main.ENGINES) == ["mediapipe", "mediapipe_lite", "yolo"]
+    client = TestClient(main.app)
+    assert client.post("/api/config", json={"engine": "mediapipe_lite"}).status_code == 200
+    try:
+        assert main.service._pending_engine == "mediapipe_lite"
+    finally:
+        main.service._pending_engine = None
+
+
+def test_a_phone_sees_and_switches_the_pose_model_over_its_socket():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.remote import create_router
+    factory = _EngineFactory()
+    service = _started_service(factory)                                         # starts on "main"
+    try:
+        def client(engines):
+            app = FastAPI()
+            app.include_router(create_router(SessionManager(), service, engine_names=lambda: engines))
+            return TestClient(app)
+        with client(["main", "other"]).websocket_connect("/ws/session") as ws:
+            hello = ws.receive_json()
+            assert hello["engine"] == "main" and hello["engines"] == ["main", "other"]
+            ws.send_bytes(_wire(1, 100.0, _jpeg(FRAME_STANDING, 48, 64)))
+            assert ws.receive_json()["engine"] == "main"                         # every reply names the model in use
+            ws.send_json({"type": "cmd", "name": "engine", "value": "nope"})
+            bad = ws.receive_json()
+            assert bad["ok"] is False and "engine must be one of" in bad["error"]
+            ws.send_json({"type": "cmd", "name": "engine", "value": "other"})
+            assert ws.receive_json() == {"type": "cmd_result", "name": "engine", "ok": True}
+            assert _wait_until(lambda: service.engine_name == "other")
+            ws.send_bytes(_wire(2, 200.0, _jpeg(FRAME_STANDING, 48, 64)))
+            reply = ws.receive_json()
+            assert reply["engine"] == "other" and reply["infer_ms"] >= 0         # and the phone can show the inference time
+        with client([]).websocket_connect("/ws/session") as ws:                  # switching not offered: refused
+            ws.receive_json()
+            ws.send_json({"type": "cmd", "name": "engine", "value": "main"})
+            assert ws.receive_json()["ok"] is False
+    finally:
+        service.stop()
+
+
+def test_the_desktop_page_gets_the_same_voice_answers_over_http():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    import app.voicecmd as voicecmd
+    from app.voice import groq_stt
+    said, seen = ["show preview"], {}
+    real_t, real_k = groq_stt.transcribe, groq_stt.api_key
+    groq_stt.api_key = lambda env_file=None: "k"
+
+    def fake(audio, key, post=None, filename="speech.wav", content_type="audio/wav"):
+        seen.update(filename=filename, content_type=content_type, size=len(audio))
+        return said[0]
+    groq_stt.transcribe = fake
+    main._local_voice_calls.clear()
+    try:
+        client = TestClient(main.app)
+        audio = b"\x1aE\xdf\xa3" * 300
+        r = client.post("/api/voice", content=audio, headers={"content-type": "audio/webm;codecs=opus"})
+        assert r.status_code == 200 and r.json() == {"type": "voice", "ok": True, "text": "show preview", "intent": "show_preview"}
+        assert seen == {"filename": "speech.webm", "content_type": "audio/webm", "size": 1200}
+        for words, intent in (("close preview", "hide_preview"), ("Let's go", "start_session"), ("stop session", "stop_session"),
+                              ("good morning", None)):
+            said[0] = words
+            if intent == "start_session":
+                main.local_session.pending_reset = False
+            reply = client.post("/api/voice", content=audio, headers={"content-type": "audio/mp4"}).json()
+            assert reply["intent"] == intent, reply
+            if intent == "start_session":                                  # the counters reset, exactly as on the phone
+                assert main.local_session.pending_reset is True
+                main.local_session.pending_reset = False
+        assert client.post("/api/voice", content=audio, headers={"content-type": "video/mp4"}).json()["ok"] is False
+        r = client.post("/api/voice", content=b"x" * (voicecmd.MAX_AUDIO_BYTES + 1), headers={"content-type": "audio/webm"})
+        assert r.status_code == 413
+        r = client.post("/api/voice", content=audio, headers={"content-type": "audio/webm", "x-forwarded-for": "203.0.113.9"})
+        assert r.status_code == 403                                        # a desktop route: not through a tunnel
+    finally:
+        groq_stt.transcribe, groq_stt.api_key = real_t, real_k
+        main._local_voice_calls.clear()
 
 
 if __name__ == "__main__":

@@ -18,11 +18,15 @@ _COCO_INDEX = {
 
 
 class YoloEngine(PoseEngine):
-    def __init__(self, device: str = "cuda:0", weights: str = "yolo11n-pose.pt", imgsz: int = 640, min_conf: float = 0.25):
+    def __init__(self, device: str = "cuda:0", weights: str = "yolo11n-pose.pt", imgsz: int = 640, min_conf: float = 0.25,
+                 half: bool = True):
         self.device = device
         self.weights = MODELS_DIR / weights
         self.imgsz = imgsz
         self.min_conf = min_conf
+        # FP16 on a CUDA GPU: about twice the speed for practically the same keypoints. (INT8 needs TensorRT calibration and
+        # costs keypoint accuracy; on a GPU FP16 is the right trade.) CPU has no half precision, so it is never asked for there.
+        self.half = bool(half and device.startswith("cuda"))
         self.name = f"yolo11n-pose-{device.split(':')[0]}"
         self.capabilities = Capabilities(has_3d=False, has_feet=False, native_bbox=True, device=device)
         self._model = None
@@ -34,10 +38,22 @@ class YoloEngine(PoseEngine):
         self._model = YOLO(str(self.weights))
         self._model.to(self.device)
         # warm-up: the first predict pays for CUDA/cuDNN init and model fusing; do it here, not on a live frame
-        self._model.predict(np.zeros((480, 640, 3), np.uint8), device=self.device, imgsz=self.imgsz, verbose=False)
+        self._model.predict(np.zeros((480, 640, 3), np.uint8), device=self.device, imgsz=self.imgsz, half=self.half, verbose=False)
 
     def infer(self, frame_bgr: np.ndarray, timestamp_ms: int) -> PoseResult | None:
-        r = self._model.predict(frame_bgr, device=self.device, imgsz=self.imgsz, conf=self.min_conf, verbose=False)[0]
+        r = self._model.predict(frame_bgr, device=self.device, imgsz=self.imgsz, conf=self.min_conf, half=self.half,
+                                verbose=False)[0]
+        return self._to_pose(r, timestamp_ms)
+
+    def infer_batch(self, frames_bgr, timestamps_ms) -> list[PoseResult | None]:
+        """The whole batch goes through the GPU in one call (the frames may differ in size)."""
+        if not len(frames_bgr):
+            return []
+        results = self._model.predict(list(frames_bgr), device=self.device, imgsz=self.imgsz, conf=self.min_conf,
+                                      half=self.half, verbose=False)
+        return [self._to_pose(r, ts) for r, ts in zip(results, timestamps_ms)]
+
+    def _to_pose(self, r, timestamp_ms: int) -> PoseResult | None:
         if r.boxes is None or len(r.boxes) == 0 or r.keypoints is None:
             return None
         xyxy = r.boxes.xyxy

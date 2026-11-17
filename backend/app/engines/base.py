@@ -78,6 +78,10 @@ class Capabilities:
 class PoseEngine(ABC):
     name: str = "base"
     capabilities: Capabilities | None = None
+    # True when infer() carries nothing from one frame to the next (YOLO). A stateful engine (MediaPipe tracks the
+    # person between video frames) must never see the frames of two different patients, so the inference service
+    # gives each session its own instance of it, and shares one instance of a stateless engine between all sessions.
+    stateless: bool = True
 
     @abstractmethod
     def load(self) -> None: ...
@@ -85,6 +89,11 @@ class PoseEngine(ABC):
     @abstractmethod
     def infer(self, frame_bgr: np.ndarray, timestamp_ms: int) -> PoseResult | None:
         """Return the single most confident pose, or None if nobody is detected."""
+
+    def infer_batch(self, frames_bgr, timestamps_ms) -> list[PoseResult | None]:
+        """One pose (or None) per frame, in the same order. The default runs the frames one by one; an engine that can
+        do better (YOLO sends the whole batch through the GPU at once) overrides it. Frames may differ in size."""
+        return [self.infer(frame, ts) for frame, ts in zip(frames_bgr, timestamps_ms)]
 
     def close(self) -> None:
         pass

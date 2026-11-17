@@ -18,6 +18,9 @@ class Pipeline:
         self.mobility = Mobility()
         self.fall = FallDetector()
         self.escalation = Escalation()      # not cleared by reset(): resetting reps must not hide an alarm
+        # False = standby: reps are NOT counted (a person still stepping into the frame must not score). Everything that
+        # protects the person (fall detection, escalation) and the step counter keep running either way.
+        self.counting = True
         self.last: dict = {}
 
     @property
@@ -38,7 +41,8 @@ class Pipeline:
         angles: dict[str, float] = {}
         if res is not None:
             angles = self.ema.update(joint_angles(res))
-            self.reps.update(angles, t)
+            if self.counting:
+                self.reps.update(angles, t)
             self.mobility.update(res, t, self.reps.active())
         fall = self.fall.update(res, t)
         fall["alert"] = self.escalation.update(fall, t)

@@ -1,4 +1,9 @@
-"""FastAPI app: webcam capture + pose inference + analytics worker thread, MJPEG stream, WS telemetry.
+"""FastAPI app. Frame sources feed patient Sessions through one InferenceService; MJPEG stream, WS telemetry.
+
+- app/sessions.py   per-patient state: analytics, fall escalation, voice check-in
+- app/inference.py  ONE thread, ONE engine, many sessions: batches waiting frames, feeds each pose to its own session
+- Worker (below)    the desktop frame source: camera + MJPEG stream; submits frames for the "local" session
+- app/remote.py     the other frame source: mobile browsers over /ws/session (off unless REMOTE_SESSIONS=1)
 
 Run from backend/:  .venv\\Scripts\\uvicorn app.main:app --port 8000
 """
@@ -14,22 +19,32 @@ from contextlib import asynccontextmanager
 os.environ.setdefault("OPENCV_VIDEOIO_DEBUG", "1")   # must precede `import cv2`: backend open/fail reasons on stderr
 os.environ.setdefault("OPENCV_LOG_LEVEL", "INFO")
 import cv2  # noqa: E402
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from collections import deque
+from pathlib import Path
+
+from starlette.concurrency import run_in_threadpool
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.engines import make_engine
+from app.inference import InferenceService
 from app.pipeline.annotate import draw
-from app.pipeline.core import Pipeline
 from app.pipeline.rep_counter import EXERCISES
-from app.voice.listener import VoiceListener
+from app.remote import create_router
+from app.security import TunnelGuard, is_tunneled
+from app.sessions import EXERCISE_NAMES, Session, SessionManager
+from app.voice import settings
+from app.voicecmd import MAX_AUDIO_BYTES, process_audio
 
 ENGINES = {
     "mediapipe": ("mediapipe", {"variant": "full"}),
+    "mediapipe_lite": ("mediapipe", {"variant": "lite"}),      # faster, less accurate: pick it on the badge to compare live
     "yolo": ("yolo", {"device": "cuda:0"}),
 }
-EXERCISE_NAMES = list(EXERCISES)
+LOCAL_SESSION_ID = "local"     # the one patient the desktop camera belongs to
 CAMERA_INDEX = 0
 CAMERA_MAX = 4                 # probe indices 0..4
 CAMERA_BACKENDS = [("dshow", cv2.CAP_DSHOW), ("msmf", cv2.CAP_MSMF)]
@@ -98,16 +113,38 @@ def default_camera_index() -> int:
     return next((i for i, n in enumerate(names) if camera_label(n) == "Laptop Webcam"), CAMERA_INDEX)
 
 
-class Worker(threading.Thread):
-    """Owns the camera, the engine and the analytics pipeline. Keeps only the latest JPEG (never queues)."""
+def _engine_kwargs(name: str) -> dict:
+    """The engine's fixed settings plus the tuning knobs from the environment / backend/.env (read at every load, so a
+    change applies the next time the engine is switched to):
+      YOLO_IMGSZ  network input size, a multiple of 32 (default 640). Phone frames are at most 480 px on the long side, so
+                  480 does about 45% less work with little loss; desktop frames are 640 wide.
+      YOLO_HALF   0 / false / off turns FP16 off (it is on by default and only ever used on a CUDA device)."""
+    kind, base = ENGINES[name]
+    kwargs = dict(base)
+    if kind == "yolo":
+        size = int(settings.get_float("YOLO_IMGSZ", 640))
+        kwargs["imgsz"] = size if 160 <= size <= 1280 and size % 32 == 0 else 640
+        kwargs["half"] = (settings.get("YOLO_HALF") or "1").lower() not in ("0", "false", "no", "off")
+    return kwargs
 
-    def __init__(self):
+
+def _create_engine(name: str):
+    """A loaded pose engine for the inference service (YOLO's load includes a dummy-frame warm-up inference)."""
+    kind = ENGINES[name][0]
+    engine = make_engine(kind, **_engine_kwargs(name))
+    engine.load()
+    return engine
+
+
+class Worker(threading.Thread):
+    """The desktop frame source: owns the camera and the MJPEG stream (the latest JPEG only, never a queue). Each frame
+    goes to the inference service for one Session; the pose comes back for drawing. Everything per-patient lives in the
+    session, and the pose engine belongs to the service."""
+
+    def __init__(self, session: Session, service: InferenceService):
         super().__init__(daemon=True)
-        self.engine_name = "yolo"
-        self.pipeline = Pipeline(EXERCISE_NAMES[0])
-        self.pending_engine: str | None = None
-        self.pending_exercise: str | None = None
-        self.pending_reset = False
+        self.session = session
+        self.service = service
         self.camera_index = CAMERA_INDEX
         self.camera_info: dict | None = None
         self.pending_camera: int | None = None
@@ -115,13 +152,12 @@ class Worker(threading.Thread):
         self.jpeg: bytes | None = None
         self.seq = 0
         self.fps = 0.0
-        self.latency_ms = 0.0
         # Smoothed per-stage cost in ms. capture_ms is mostly time spent WAITING for the camera's next frame
-        # (the camera sets the pace), not CPU work, so do not try to optimise it; the other four are real cost.
+        # (the camera sets the pace), not CPU work, so do not try to optimise it. infer_ms is the engine time of the
+        # batch this frame was in, pipeline_ms the session's analytics for it; both are measured inside the service.
         self.timings = {"capture_ms": 0.0, "infer_ms": 0.0, "pipeline_ms": 0.0, "draw_ms": 0.0, "encode_ms": 0.0}
         self.privacy = False            # requested via POST /api/config; plain bool, read once per frame
         self.jpeg_private = False       # the published jpeg was encoded with privacy on (guards the stream)
-        self.pose_visible = False
         self.error: str | None = None
         self.new_frame = threading.Condition()
         self.stop_flag = threading.Event()
@@ -143,26 +179,11 @@ class Worker(threading.Thread):
                 cap.release()
             self.camera_index, self.camera_info, self.error = j, info, None
             self.camera_error = None if j == idx else f"camera {idx} not available, using camera {j} instead"
-            self.pipeline.fall.reset()      # perspective / distance changed: relearn the standing baseline
+            self.session.request_baseline_reset()   # perspective / distance changed: relearn the standing baseline
             return new
         self.camera_error = f"no camera found near index {idx}; kept camera {self.camera_index}"   # old stream stays alive
         log.error("camera switch failed: %s", " | ".join(failures))
         return cap
-
-    def _apply_pending(self, engine):
-        if self.pending_engine and self.pending_engine != self.engine_name:
-            engine.close()
-            self.engine_name = self.pending_engine
-            engine = make_engine(ENGINES[self.engine_name][0], **ENGINES[self.engine_name][1])
-            engine.load()
-        self.pending_engine = None
-        if self.pending_exercise and self.pending_exercise != self.pipeline.exercise:
-            self.pipeline.set_exercise(self.pending_exercise)
-        self.pending_exercise = None
-        if self.pending_reset:
-            self.pipeline.reset()
-            self.pending_reset = False
-        return engine
 
     def run(self):
         cap, info = open_camera(self.camera_index)
@@ -170,17 +191,9 @@ class Worker(threading.Thread):
             self.error = f"cannot open camera {self.camera_index} ({info})"   # keep running so the user can switch
         else:
             self.camera_info = info
-        try:
-            engine = make_engine(ENGINES[self.engine_name][0], **ENGINES[self.engine_name][1])
-            engine.load()               # YOLO load includes a dummy-frame warm-up inference
-        except Exception:  # noqa: BLE001  no GPU / missing weights must not kill the stream
-            log.exception("default engine %s failed to load, falling back to mediapipe", self.engine_name)
-            self.engine_name = "mediapipe"
-            engine = make_engine(ENGINES[self.engine_name][0], **ENGINES[self.engine_name][1])
-            engine.load()
+        self.service.wait_ready()           # the engine is loaded (or every candidate failed): same wait as before
         t0 = prev = time.perf_counter()
         while not self.stop_flag.is_set():
-            engine = self._apply_pending(engine)
             cap = self._apply_camera(cap)
             tc = time.perf_counter()
             ok, frame = cap.read() if cap is not None else (False, None)
@@ -188,14 +201,12 @@ class Worker(threading.Thread):
                 time.sleep(0.01)
                 continue
             t1 = time.perf_counter()
-            res = engine.infer(frame, int((t1 - t0) * 1000))
-            t2 = time.perf_counter()
-            self.latency_ms = (t2 - t1) * 1000
-            self.pose_visible = res is not None
-            self.pipeline.process(res, t1 - t0)
+            # one hop through the service: pose, analytics, fall escalation and the voice follow-up all happen there
+            result = self.service.infer(self.session, frame, t1 - t0)
+            if result is None or result.dropped or result.error:
+                continue                    # busy, stopping or failed: nothing to draw or publish for this frame
+            res = result.pose
             t3 = time.perf_counter()
-            if voice.active and self.pipeline.last["fall"]["alert"]["state"] not in ("COUNTDOWN", "ALERTED"):
-                voice.stop()                # the fall dialog is gone: close the microphone (a bool check per frame)
             private = self.privacy         # read once: the blanking and the published flag must agree
             if private:
                 frame[:] = 0                # in place, after inference and analytics: raw video is never encoded
@@ -206,57 +217,81 @@ class Worker(threading.Thread):
             now = time.perf_counter()
             self.fps = 0.9 * self.fps + 0.1 / max(now - prev, 1e-3)
             prev = now
-            for key, dt in (("capture_ms", t1 - tc), ("infer_ms", t2 - t1), ("pipeline_ms", t3 - t2),
-                            ("draw_ms", t4 - t3), ("encode_ms", now - t4)):      # blanking is part of draw_ms
-                self.timings[key] = 0.9 * self.timings[key] + 0.1 * dt * 1000
+            for key, ms in (("capture_ms", (t1 - tc) * 1000), ("infer_ms", result.infer_ms),
+                            ("pipeline_ms", result.pipeline_ms), ("draw_ms", (t4 - t3) * 1000),
+                            ("encode_ms", (now - t4) * 1000)):      # blanking is part of draw_ms
+                self.timings[key] = 0.9 * self.timings[key] + 0.1 * ms
             with self.new_frame:
                 self.jpeg = buf.tobytes()
                 self.jpeg_private = private
                 self.seq += 1
                 self.new_frame.notify_all()
-        engine.close()
         if cap is not None:
             cap.release()
 
     def telemetry(self) -> dict:
-        out = {
+        """The source's own fields (camera, engine, speed, stream) plus the patient's, from the session."""
+        engine = self.service.engine_name
+        return {
             "camera_index": self.camera_index,
             "camera_backend": (self.camera_info or {}).get("backend"),
             "camera_error": self.camera_error,
-            "engine": self.engine_name,
-            "device": ENGINES[self.engine_name][1].get("device", "cpu"),
+            "engine": engine,
+            "device": ENGINES[engine][1].get("device", "cpu"),
             "fps": round(self.fps, 1),
-            "latency_ms": round(self.latency_ms, 1),
             "timings": {k: round(v, 2) for k, v in self.timings.items()},
             # True only once a blanked frame has actually been published, so the UI can trust it as confirmation
             "privacy": self.privacy and self.jpeg_private,
-            "pose_visible": self.pose_visible,
             "error": self.error,
-            "exercise": self.pipeline.exercise,
-            **self.pipeline.last,
+            **self.session.telemetry(),
         }
-        fall = out.get("fall")
-        if fall is not None:
-            out["fall"] = {**fall, "voice": voice.snapshot()}   # a copy: pipeline.last belongs to the worker thread
-        return out
 
 
-worker = Worker()
-voice = VoiceListener(on_ok=worker.pipeline.escalation.ack, on_help=worker.pipeline.escalation.escalate)
+def _remote_enabled() -> bool:
+    return (settings.get("REMOTE_SESSIONS") or "").lower() in ("1", "true", "yes", "on")
+
+
+def _remote_limit() -> int:
+    return int(settings.get_float("REMOTE_MAX_SESSIONS", 4))
+
+
+def _remote_token() -> str:
+    return settings.get("REMOTE_ACCESS_TOKEN", "") or ""
+
+
+def _remote_origins() -> list[str]:
+    return [o.strip() for o in (settings.get("REMOTE_ALLOWED_ORIGINS") or "").split(",") if o.strip()]
+
+
+DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"     # `npm run build` output, served on :8000 when present
+
+
+sessions = SessionManager()
+local_session = sessions.create(LOCAL_SESSION_ID, local_voice=True)
+service = InferenceService(_create_engine, engine_name="yolo", fallback_engine="mediapipe")
+worker = Worker(local_session, service)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     worker.camera_index = default_camera_index()    # enumerated here, not on the worker thread that owns the capture
-    voice.init()                           # checks for the Groq key; the microphone opens only during a fall check
+    if _remote_enabled() and not _remote_token():
+        log.warning("REMOTE_SESSIONS is on but REMOTE_ACCESS_TOKEN is empty: anyone who can reach this server can start a "
+                    "remote session. Set a token before exposing it through a tunnel.")
+    local_session.open()                   # checks for the Groq key; the microphone opens only during a fall check
+    service.start()                        # loads the engine; sessions' frames are inferred (and fed) on its thread
     worker.start()
     yield
     worker.stop_flag.set()
-    voice.quit()
+    service.stop()
+    sessions.close_all()
 
 
 app = FastAPI(title="AI Rehab Tracker", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(TunnelGuard)      # requests through a tunnel/proxy cannot reach the desktop routes (app/security.py)
+app.include_router(create_router(sessions, service, enabled=_remote_enabled, max_remote=_remote_limit,
+                                 token=_remote_token, allowed_origins=_remote_origins, engine_names=lambda: list(ENGINES)))
 
 
 class Config(BaseModel):
@@ -266,8 +301,11 @@ class Config(BaseModel):
 
 
 @app.get("/api/health")
-def health():
-    return {"status": "ok" if worker.error is None else "error", **worker.telemetry()}
+def health(request: Request):
+    public = {"remote_sessions": _remote_enabled(), "remote_auth": bool(_remote_token())}
+    if is_tunneled(request.scope["headers"]):       # a tunnel visitor learns only what the connect screen needs
+        return {"status": "ok" if worker.error is None else "error", **public}
+    return {"status": "ok" if worker.error is None else "error", **public, **worker.telemetry()}
 
 
 @app.get("/api/exercises")
@@ -291,11 +329,12 @@ def config(cfg: Config):
     if cfg.engine is not None:
         if cfg.engine not in ENGINES:
             raise HTTPException(400, f"engine must be one of {list(ENGINES)}")
-        worker.pending_engine = cfg.engine
+        service.request_engine(cfg.engine)      # applied between batches; if it fails to load the current one stays
     if cfg.exercise is not None:
-        if cfg.exercise not in EXERCISES:
-            raise HTTPException(400, f"exercise must be one of {EXERCISE_NAMES}")
-        worker.pending_exercise = cfg.exercise
+        try:
+            local_session.request_exercise(cfg.exercise)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     if cfg.privacy is not None:
         worker.privacy = cfg.privacy    # applied by the worker on its next frame
     return worker.telemetry()
@@ -340,36 +379,67 @@ def camera(c: Camera):
 @app.post("/api/fall/ack")
 def fall_ack():
     """"I'm OK": answers the fall countdown or silences a raised alert."""
-    worker.pipeline.escalation.ack()    # only raises a flag; the worker thread applies it on its next frame
+    local_session.ack()    # only raises a flag; the inference thread applies it on the next frame
     return {"ok": True}
 
 
 @app.post("/api/fall/listen")
 def fall_listen():
     """The dialog's spoken prompt has finished: open the microphone (only during a fall check)."""
-    state = worker.pipeline.last.get("fall", {}).get("alert", {}).get("state")
-    if state in ("COUNTDOWN", "ALERTED"):
-        voice.start()
-    return {"ok": True, "status": voice.status, "error": voice.error}
+    return {"ok": True, **local_session.listen()}
 
 
 @app.post("/api/fall/escalate")
 def fall_escalate():
     """"Trigger Emergency": skips the rest of the countdown."""
-    worker.pipeline.escalation.escalate()
+    local_session.escalate()
     return {"ok": True}
 
 
 @app.post("/api/fall/test")
 def fall_test():
     """TEMP (Test Fall button): simulate a confirmed fall so the countdown dialog can be tried without falling."""
-    worker.pipeline.escalation.simulate()
+    local_session.simulate_fall()
+    return {"ok": True}
+
+
+_local_voice_calls: deque[float] = deque()      # upload times for the desktop page's rate limit
+
+
+@app.post("/api/voice")
+async def voice(request: Request):
+    """One spoken utterance from the desktop page's microphone ("Server camera" mode): the body is the audio, the
+    Content-Type its format. Same processing as the phone's `audio` socket message (app/voicecmd.py). A desktop route:
+    refused through a tunnel by TunnelGuard."""
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_AUDIO_BYTES:
+        raise HTTPException(413, "audio too large")
+    raw = b""
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > MAX_AUDIO_BYTES:
+            raise HTTPException(413, "audio too large")
+    return await run_in_threadpool(process_audio, local_session, local_session.voice, raw,
+                                   request.headers.get("content-type", ""), _local_voice_calls)
+
+
+@app.post("/api/session/start")
+def session_start():
+    """HUD Start (Server camera): counters to 0 and rep counting on, same as saying "let's go"."""
+    local_session.request_start()
+    return {"ok": True}
+
+
+@app.post("/api/session/stop")
+def session_stop():
+    """HUD Pause (Server camera): rep counting back to standby."""
+    local_session.request_stop()
     return {"ok": True}
 
 
 @app.post("/api/reset")
 def reset():
-    worker.pending_reset = True
+    local_session.request_reset()
     return {"ok": True}
 
 
@@ -401,3 +471,8 @@ def mjpeg():
 @app.get("/api/video_feed")
 def video_feed():
     return StreamingResponse(mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+# Last, so every API and WebSocket route above wins: the built frontend, for a single-port deployment on :8000.
+if DIST.is_dir():
+    app.mount("/", StaticFiles(directory=DIST, html=True), name="frontend")

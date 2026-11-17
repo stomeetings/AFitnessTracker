@@ -541,6 +541,297 @@ working headset could be failed as "unavailable" during the quiet seconds after 
 - Tests: list parsing, KORP matching in every spelling, fall-through of choices, rate fallback / real error, a silent
   device warns and keeps listening (57 tests expected).
 
+### Cloud + mobile architecture blueprint (2026-11-16) — plan only, nothing implemented
+
+Saved as `docs/cloud_mobile_blueprint.md`. Work on it starts next session; no application code was changed for it.
+- **Central point:** a cloud server has no camera or microphone, so capture must move into the patient's browser and
+  the single global `Worker` must become one pipeline per connected patient.
+- **Recommendations:** pose on the phone (MediaPipe in the browser) as the production default with server YOLO as
+  fallback; WSS with ack-paced JPEG frames (one frame in flight) instead of WebRTC; no video sent back (keypoints +
+  telemetry, skeleton drawn on a canvas over the local preview); browser microphone + speech detection, utterances
+  uploaded to a new `/api/voice` that reuses `groq_stt` and `intent.classify`; PWA for exercise sessions, a fixed
+  tablet on a charger for fall monitoring (native only for background monitoring / guaranteed alerts).
+- **Phases:** 0 close out MVP (commit/push, rotate the Groq key, live voice test) -> 1 sessions in the backend ->
+  2 browser camera to cloud inference -> 3 browser voice -> 4 auth, TLS, CORS, deployment -> 5 mobile UI / PWA ->
+  6 on-device pose.
+- **Decisions the user must make before Phase 1:** on-device pose as default or server-only; GPU or CPU hosting and
+  region; primary use case (own phone vs fixed tablet); Ultralytics AGPL licence if YOLO is served from the cloud.
+- Bandwidth and latency figures in the blueprint are estimates, to be replaced by measurements in Phase 2.
+
+### Where things stand at the end of this session (resume here)
+
+- Tests: 57/57 passed and `npx tsc --noEmit` clean on the last runs (after the KORP THALLIUM device work).
+- **Not yet verified live:** the fall dialog with the headset microphone through Groq (click Test Fall, wait for the
+  prompt, say "help"; read the `voice:` lines in the backend terminal). `backend/.env` has
+  `STT_INPUT_DEVICE=KORP THALLIUM`.
+- **Git:** on `main`; last commit seen was `d37caf3` ("checkpoint MVP and add implementation plans"). Everything since
+  (timings, Privacy Mode, Groq voice, escalation re-check, docs) was uncommitted when last checked. Commit steps
+  given to the user: delete the stub `backend/app/voice/stt_process.py`, `git add .gitignore backend frontend tests
+  docs/activity_log.md docs/plans docs/cloud_mobile_blueprint.md`, confirm no `.env` or `docs/sample/` is staged,
+  commit, `git push`. Run `git status` first thing.
+- Housekeeping still open: rotate the Groq key (it was pasted into chat); remove the temporary `[voice] DEBUG`
+  console logs in `FallCheck.tsx`; uninstall `sherpa-onnx` and delete its model folder under `backend/models/`.
+- The assistant session has no shell: the user runs commands with the `!` prefix (bash: forward slashes, `!` must be
+  the first character) or in a normal PowerShell window.
+
+### Phase 1 of the cloud/mobile blueprint: sessions extracted (2026-11-17) — implemented, NOT yet run
+
+Done by a Sonnet 5.5 session with no shell: nothing below has been executed.
+- New `backend/app/sessions.py`:
+  - `Session` = everything per patient and nothing about cameras or engines: `Pipeline` (exercise, reps, mobility,
+    fall detector, escalation), the voice listener (optional: `local_voice=True` only for the desktop kiosk, so two
+    sessions never compete for one microphone), `pose_visible`, `latency_ms`, and the pending-command flags.
+    Commands safe from any thread (only set flags): `request_exercise` (raises `ValueError` with the old message),
+    `request_reset`, `ack`, `escalate`, `simulate_fall` (TEMP), `listen`. Feeder-thread-only: `apply_pending`,
+    `reset_fall_baseline`, `process(res, t, infer_ms, frame_width)`, which also closes the microphone once the fall
+    dialog is gone. `telemetry()` returns the patient's fields; `open()` / `close()` for lifecycle (idempotent).
+  - `SessionManager`: `create` (random id if none; refuses duplicate ids, unknown exercises, and a full house via
+    `SessionLimitError`; nothing is registered on failure), `get`, `close`, `close_all`, `ids`, `len`, `in`.
+  - `to_reference(res, frame_width)`: rescales a pose to the 640-wide frame `fall_detector.py`'s pixel constants assume.
+- `backend/app/main.py`: `Worker(session)` keeps the camera, engine, MJPEG stream, privacy flag, fps and timings;
+  per-patient work goes through `local_session` (created by `SessionManager` as id "local"). The global `voice`, and
+  `worker.pipeline` / `pending_exercise` / `pending_reset` are gone. Routes keep their URLs, JSON and error text:
+  `/api/config`, `/api/reset`, `/api/fall/{ack,listen,escalate,test}`, `/api/telemetry`, `/api/health`, `/ws/telemetry`,
+  `/api/video_feed`, `/api/cameras`, `/api/camera`. Telemetry has exactly the same keys (source fields from the worker,
+  patient fields from the session).
+- Deliberately NOT done (later phases): the desktop worker does not pass `frame_width`, so desktop behaviour is
+  unchanged; no idle-session expiry, no HTTP session ids/auth (all routes still address the one local session), engine
+  and inference are still owned by the worker (batching across sessions is Phase 2).
+- Tests added to `tests/test_analytics.py` (63 expected): two sessions share no state; commands only set flags until
+  `apply_pending`; voice start/stop follows the fall dialog and voice-less sessions work; manager lifecycle and limits;
+  `to_reference` (and a 320 / 1280 px frame gives the same fall verdict as 640); and a route test with FastAPI's
+  TestClient (no `with`, so the lifespan, camera, engine and microphone never start) that checks every desktop route
+  and the telemetry keys the frontend reads.
+- To verify: `backend/.venv/Scripts/python tests/test_analytics.py` (63/63), then start the backend and use the app
+  as usual (camera pills, exercise switch, Reset, Test Fall dialog, Privacy, engine switch); `/api/telemetry` should look
+  the same as before. Next phase: browser camera to cloud inference (`/ws/session`).
+
+### Phase 2 of the cloud/mobile blueprint, backend half: multi-session inference (2026-11-17) — implemented, NOT yet run
+
+Done by a Sonnet 5.5 session with no shell: nothing below has been executed, and Phase 1 itself had not been run
+either when this was written (run the tests for both before trusting either).
+- New `backend/app/inference.py` `InferenceService`: ONE thread, one engine, many sessions. Each cycle it applies an
+  engine change, forgets closed sessions and applies every registered session's pending commands (so it is the only
+  feeder thread of every session, as `sessions.py`'s threading contract needs), takes the NEWEST frame of each session
+  that has one waiting (older ones resolve as `dropped`; at most `max_batch`=8 per cycle, longest-waiting first), runs
+  the poses, feeds each pose to its own session with the frame's size, and resolves the frame's Future with a
+  `FrameResult` (pose in the frame's own pixels for drawing, `infer_ms`, `pipeline_ms`, `batch_size`, `dropped`, `error`).
+  `submit()` never blocks; `infer()` waits with a timeout and returns None on timeout (never feeds a made-up empty pose).
+  Failures are contained per session: an engine error gives that frame an error result and that session is NOT fed
+  ("engine hiccup" is not "nobody in view"); a failed batch is retried frame by frame. A failed engine switch keeps the
+  current engine; if the default engine fails to load the fallback ("mediapipe") is used, as before; if nothing loads,
+  sources get error results instead of hanging.
+- Engines: `PoseEngine.stateless` (default True) and `infer_batch()` (default: loop). `YoloEngine.infer_batch` sends the
+  whole batch through the GPU in one `predict` call (`infer` now shares `_to_pose` with it; same behaviour as before).
+  `MediaPipeEngine.stateless = False`: it tracks between frames, so the service gives each session its OWN instance
+  (and closes it when the session is forgotten) instead of sharing one across patients.
+- `sessions.py`: `to_reference(res, width, height)` now scales by the frame's LONG side (640 px) so portrait and landscape
+  phone frames and the 640 x 480 webcam are judged at the same scale (the blueprint said "640-wide"; width alone would
+  inflate a 480 x 640 portrait frame by a third). `Session.process(..., frame_width, frame_height)`; the service always
+  passes the real frame size. Desktop frames at 640 x 480 are unchanged (identity); other webcam sizes are now normalised.
+  `reset_fall_baseline()` became the flag `request_baseline_reset()` applied in `apply_pending()` (the camera thread no
+  longer touches the pipeline).
+- `main.py`: the `Worker` is only camera + MJPEG stream; it submits each frame with `service.infer(local_session, ...)`
+  and draws the returned pose. Engine ownership and switching moved to the service (`/api/config` engine ->
+  `service.request_engine`). Telemetry keys unchanged; `infer_ms` / `pipeline_ms` now come from the service.
+- New `backend/app/remote.py`: `/ws/session` gateway. Protocol (docstring): binary `[u32 seq][f64 capture ms][JPEG]` in,
+  `{"type":"t","ack":seq,"frame","pose":{kp,bbox},...telemetry}` out, `{"type":"cmd",...}` for exercise / reset / ack_fall
+  / escalate. Decoding runs off the event loop, only the newest unprocessed frame is kept, remote ids are `remote-...`,
+  the session is closed and forgotten on disconnect. **OFF unless `REMOTE_SESSIONS=1`** (no authentication yet; Phase 4),
+  capped by `REMOTE_MAX_SESSIONS` (default 4). Documented in `backend/.env.example`.
+- NOT done (still Phase 2 in the blueprint): the frontend (`useCamera`, capture pump, canvas skeleton overlay, dropping
+  `/api/video_feed`), and `?session=` scoping of the REST config / fall endpoints. No auth, TLS, or limits beyond the cap.
+- Tests (16 new, 79 expected): reference scale by long side and the baseline flag; routing each frame to its own
+  session; batching (gate-held engine, 4 sessions in one call, `max_batch` cap with no starvation); newest frame wins;
+  failure containment; stateful engine per session and release on forget; engine switch and failed switch; fallback and
+  no-engine; five resolutions / orientations give the identical fall verdict; timeout feeds nothing; pending commands
+  swept without frames; desktop worker wiring (and `/ws/session` refused by default); remote session end to end with
+  TestClient; refusal when disabled or full.
+- To verify: `backend/.venv/Scripts/python tests/test_analytics.py` (79/79), then use the desktop app as usual (video,
+  skeleton, reps, Test Fall, engine switch YOLO <-> MediaPipe, Privacy, camera switch): behaviour should be unchanged.
+  Watch `fps` and the timings line: the frame now makes one hop through the service thread.
+
+### Browser camera mode + PWA basics (2026-11-17) — implemented, NOT yet run
+
+Requested as "Phase 3 of the blueprint"; in the blueprint this is the frontend half of Phase 2 plus the PWA part of
+Phase 5 (its Phase 3, browser voice, is untouched). Written without a shell: nothing was type-checked, built or run.
+- Header toggle "Server camera | This device" (saved in localStorage). Server camera = the old page, default, untouched
+  behaviour. This device = `frontend/src/remote/`:
+  - `useRemoteSession.ts`: `getUserMedia` (front/rear via `facingMode: ideal`, camera switch keeps the old one on failure),
+    `/ws/session` client with backoff reconnects (re-sends the chosen exercise on a new session), ack-paced JPEG pump
+    (one frame in flight, 3 s ack timeout, 480 px / q0.6 stepping down to 320 / 0.4 when the round trip passes 250 ms),
+    commands (exercise, reset, ack_fall, escalate, test_fall), screen wake lock, camera-interrupted handling. Nothing
+    starts until the "Start camera" tap.
+  - `RemoteView.tsx`: `<video playsInline muted>` preview with a canvas skeleton overlay (colour follows fall status),
+    rep chips, status chip, start/error states; mirrored by CSS only for the front camera (sent frames never mirrored);
+    `RemotePanel`: switch camera, stop, fps / round trip / frame size.
+  - `logic.ts` (+ `logic.test.ts`, 14 vitest cases): wire format (matches `struct ">Id"`), capture size by long side,
+    adaptive quality, backoff, letterbox mapping, pose drawing.
+- Privacy in this mode hides the preview image immediately; frames still go to the server (inference needs them).
+- `FallCheck` takes optional `onAck` / `onEscalate` / `canListen` (defaults = old behaviour); in device mode the dialog
+  answers over the socket and does not ask the backend for a microphone (no voice for remote patients until blueprint
+  Phase 3). Telemetry type: the six server-camera fields became optional. Test Fall works in both modes.
+- Backend (small): socket command `test_fall`; `/api/health` now has `remote_sessions` so the UI can say "switched off".
+  One test line added (79 tests unchanged in count).
+- PWA: `manifest.webmanifest`, SVG `icon.svg`, `sw.js` (network first, never touches `/api` or `/ws`; registered only in
+  production builds), `index.html` meta tags, `viewport-fit=cover`; layout padding/wrapping for phones.
+- Needs HTTPS for the camera on a phone (a plain `http://192.168...` page has no camera API); localhost is exempt. The
+  existing `.loca.lt` tunnel gives HTTPS. The backend needs `REMOTE_SESSIONS=1`.
+- Known limits: skeleton lags the preview by one round trip; a backgrounded tab throttles timers (frames slow down);
+  a reconnect starts a fresh server session (rep counts reset); no auth yet (Phase 4).
+- To verify: `cd frontend; npm install; npx tsc --noEmit; npm test`, then the manual steps in the chat summary.
+
+### Tunnel readiness and access control (2026-11-17) — implemented, NOT yet run
+
+Phase 4 (first slice) of the blueprint, for trying "This device" from a real phone over cloudflared / ngrok. Written without a
+shell: not type-checked, built or run. Runbook with exact commands: `docs/cloud_mobile_blueprint.md`.
+- Found while planning: a tunnel on :5173 would have published the DESKTOP routes too (the laptop's camera stream
+  `/api/video_feed`, camera switch, config, fall buttons, telemetry). New `backend/app/security.py` `TunnelGuard` refuses those
+  for any request that arrived through a proxy (forwarding headers the proxy adds, or a public-looking Host name); direct
+  localhost / LAN use is unchanged. `/api/health` shows a tunnel visitor only status + `remote_sessions` + `remote_auth`.
+- `/ws/session`: `REMOTE_ACCESS_TOKEN` (first message `{"type":"auth","token"}` within 5 s, else close 4401; constant-time
+  compare; global limiter of 10 wrong tokens / minute; token never in a URL, so never in uvicorn or tunnel logs), browser
+  Origin must match the Host (or X-Forwarded-Host) or be in `REMOTE_ALLOWED_ORIGINS`, cap of 16 unauthenticated sockets,
+  session cap re-checked after auth, text messages capped at 4 KB and frames at 2 MB, startup warning when remote sessions
+  are on without a token. Teardown on disconnect was already in place (`finally`: forget + close session). Setting name stays
+  `REMOTE_MAX_SESSIONS` (not `MAX_REMOTE_SESSIONS`).
+- Frontend: `?token=` is read, saved and removed from the address bar; a token field appears when the server wants one
+  (checked via `/api/health` before the camera prompt) or rejects it; the token is sent as the first socket message. Any address
+  other than localhost starts in "This device" mode (a saved choice still wins); the server-camera telemetry socket is no longer
+  opened while that mode is not showing.
+- Vite: `allowedHosts` now covers `.trycloudflare.com`, ngrok domains and `.loca.lt` (a tunnel name would otherwise get "Blocked
+  request"), for dev and preview; `/api` and `/ws` (ws: true) proxying was already correct and the Host header is not rewritten.
+- FastAPI serves `frontend/dist` on :8000 when it exists (single-port option; mounted last so APIs win).
+- Tests: 5 new Python tests (token/origin/limiter/host basics, token flow incl. stray auth, lockout, silent client; origin checks;
+  tunnel guard; health through a tunnel) and 4 new vitest cases (`extractToken`, `isLocalHost`). Two older tests now also pass
+  when `REMOTE_SESSIONS=1` is set in `backend/.env`. Expected: 84 Python tests, 18 vitest.
+- Limits: the token is one shared secret, not per-user; REST CORS is still `*`; nothing terminates HTTPS itself (the tunnel does).
+- To verify: `backend/.venv/Scripts/python tests/test_analytics.py`; `cd frontend; npm install; npx tsc --noEmit; npm test; npm run build`.
+
+### Voice in "This device" mode (2026-11-17) — implemented, NOT yet run
+
+Audit: the voice code was only ever the FALL CHECK-IN on the server's own microphone (`VoiceListener` + `recorder`, opened while
+the fall dialog is up, understanding just "ok" / "help"). The browser never recorded anything, remote sessions have no
+`local_voice`, and the page passed `canListen={false}` in device mode. The commands "start my session", "show / hide preview" and
+"stop session" did not exist anywhere (only listed as a plan in the blueprint), so they could not have worked in Server Camera
+mode either.
+- Backend: `intent.classify_command` (verb + noun anywhere in the sentence, one letter of slack, any negative or ambiguity gives
+  None); `groq_stt.transcribe(..., filename, content_type)` so browser formats (webm, mp4/m4a, aac, ogg ...) are named correctly;
+  `/ws/session` accepts `{"type":"audio","mime","data":base64}` (<= 400 kB, one at a time, 20 per minute per session), runs Whisper in
+  an executor, and answers `{"type":"voice","ok","text","intent"}`. `remote.interpret`: with a fall check open only the safety
+  answers count (through a `VoiceListener` used for its sentence-joining logic only, no microphone), otherwise only commands;
+  "start session" resets the counters server-side. Not stored; `NO_KEY` -> status "unavailable".
+- Frontend (`frontend/src/remote/voice.ts`, hook, view): `getUserMedia` asks camera and microphone in one prompt on the Start tap
+  (a refused or missing microphone leaves the camera running and shows "Mic blocked"); MediaRecorder type chosen from webm/opus,
+  webm, mp4, aac, else the browser default; an always-running recorder is cut at the end of each sentence so the first word is
+  not lost; speech detector with an adaptive threshold; paused while the page speaks or ticks. Mic chip (Listening / Processing /
+  Mic blocked / Voice unavailable) and the last sentence heard on the video, status line in the panel, and the fall dialog shows
+  the same status it shows for the desktop microphone. Stop session stops camera and microphone (one tap restarts); hide / show
+  preview = Privacy switch.
+- Why on the socket, not `/api/voice`: the blueprint sketched a REST upload; the socket is already authenticated, origin-checked,
+  capped and allowed through the tunnel guard, so no new public route and no token header to forward.
+- Tests: 4 new Python (commands, transcribe format, voice over the gateway incl. fall answers and context rules, rejects and rate
+  limit) -> 88 expected; 10 new vitest (MIME choice, detector, quiet hold) -> 28 expected.
+- Limits: the continuous microphone costs one Whisper call per utterance, background talk included (capped at 20 / min); the
+  alarm sound during "No response" is not filtered out of the microphone (the phone's echo cancellation has to handle it); no
+  voice outside a fall check in Server Camera mode.
+- To verify: Python and frontend checks as before, then on the phone say each command, and during Test Fall say "I am fine".
+
+### Voice commands unified across "Server camera" and "This device" (2026-11-17) — implemented, NOT yet run
+
+Before this, commands existed only for phones. Now one path serves both:
+- Backend: new `app/voicecmd.py` (`audio_name`, `interpret`, `process_audio`) used by BOTH `/ws/session`'s `audio` message and the
+  new `POST /api/voice` (body = audio, Content-Type = format; 413 over 400 kB; a desktop route, so refused through a tunnel).
+  `interpret` (moved out of `remote.py`): fall check open -> only "I am fine" / "help"; otherwise only commands; "start session"
+  resets the counters. New phrases: "let's go" / "lets go" / "let us go" (<= 6 words, any negative cancels it).
+- Frontend: `useVoiceInput` (capture, status, last sentence heard; the caller supplies `upload`: socket on a phone, `uploadToServer`
+  on the desktop page), `VoiceChip` (`Heard: "..."`, same in both modes), `intentEffects` in `voice.ts` = the single mapping from a
+  command to page changes, applied in one `App` effect for both modes, 700 ms after the chip shows the sentence.
+- Rules as built: show preview -> visible; hide preview -> hidden; start session / let's go -> counters reset (server) AND preview
+  hidden; stop session -> preview hidden, and a phone also stops its camera (the server's camera keeps running, so in Server camera
+  mode "stop session" only hides the preview). "Preview" = `showPreview` state (session-only; the Privacy switch is separate and
+  saved; either hides the image). In Server camera mode hiding also switches the backend's blanking on, so the skeleton stays on black.
+- FIX (same day): "display preview" was heard but did nothing when the saved Privacy switch was on (an earlier build's voice "hide
+  preview" had saved it), because Privacy won over the new session-only preview state. Now "show preview" also switches Privacy off
+  (`intentEffects().clearPrivacy`); "hide preview" never turns it on. Also: a later utterance that is not a command no longer cancels
+  a command still waiting for its 700 ms delay. vitest 35 expected.
+- Session completion auto-hide: a phone session that ends (stop, interrupted camera) hides the preview, and the next Start shows it
+  again. ASSUMPTION: Server camera mode has no session end of its own, so nothing else triggers it there.
+- Server camera: the browser microphone is opt-in (header "Voice" button, remembered, restarted by itself when the browser already
+  granted it) and is released while the fall dialog is open, when the backend's own microphone answers it, so the two never fight over
+  one device.
+- Tests: Python +1 (`/api/voice`: same answers incl. "let's go", mp4/webm names, 413, tunnel 403) and the command test extended;
+  vitest +6 (`intentEffects` identical preview change in both modes, `micErrorText`). Expected: 89 Python, 34 vitest.
+
+### CORRECTION: "preview" means the Exercise Guide, not the camera image (2026-11-17)
+
+I had read "show / hide preview" as hiding the camera image (several rounds of fixes, banners and diagnostics for a symptom that was
+really a misreading). It means the Exercise Guide modal (Info button, animated skeleton). Now: `intentEffects` returns `showGuide`;
+"show / display preview" opens the guide (the same `guideOpen` state the Info button sets), "hide / close preview" closes it, "start
+session" / "let's go" and "stop session" close it, and a phone session that ends closes it. Everything that hid the camera image by voice
+(`showPreview`, `previewEpoch`, the banners, `clearPrivacy`, the extra console state line) was removed; the Privacy switch is back to
+exactly what it was. The `[voice] heard ... -> intent` and `[voice] applying` console lines stay. vitest 34 expected.
+Known: the guide is a modal, so it covers the voice chip; the commands still work while it is open.
+
+### Camera switch fix: "Could not start video source" (2026-11-17) — implemented, NOT yet run on a phone
+
+Cause (likely, from the message): the switch opened the new camera BEFORE releasing the old one, and most phones cannot hold two
+cameras at once (Android Chrome: NotReadableError "Could not start video source"). `switchCamera` now releases the current camera
+first, waits 200 ms, then tries the other camera with `facingMode: ideal`, then `exact`, then goes back to the previous camera with
+a message; if even that fails the session stops with "Tap Start to try again". Taps during a switch are ignored. The microphone is
+untouched. No device-ID logic: `facingMode` is what mobile browsers expect, and device IDs change between visits.
+
+### Pose-model badge and switcher on the phone (2026-11-17) — implemented, NOT yet run
+
+- Backend: every `/ws/session` reply carries `engine` (the model in use), `hello` carries `engine` and `engines` (from `ENGINES`),
+  and the socket command `{"type":"cmd","name":"engine","value":"yolo"}` calls `InferenceService.request_engine` (applied between batches; a failed
+  load keeps the old model; a name not in the list, or no list, is refused). The switch is SERVER-WIDE: it also changes the model the
+  laptop and any other phone are using. Reachable through a tunnel because it rides the authenticated socket (`/api/config` is not).
+- Frontend: a badge under the status chip, `[chip] YOLO 21 ms tap to switch`: model, smoothed inference time from the server's
+  `infer_ms`, tap = switch to the other one (spinner and `-> MediaPipe...` until the replies name the new model; gives up waiting after
+  a minute). The panel line also shows `fps / round trip / frame size / model ms`. Pure helpers `engineLabel`, `nextEngine` in `logic.ts`.
+- Tests: +1 Python (hello/replies name the model, bad name refused, switch applies, no list = refused), +3 vitest. Expected: 90 Python,
+  37 vitest.
+- Evaluating on the phone: the inference time is the server-side model time only; `fps` and `round trip` include the network. MediaPipe
+  here keeps one model instance per session (it tracks between frames), YOLO shares one, so with several phones YOLO scales better.
+
+### Standby until "let's go" + full-screen HUD (2026-11-17) — implemented, NOT yet run
+
+- Standby is a SERVER-side switch, not just a display: `Pipeline.counting` skips `RepCounter.update` while false. Fall detection,
+  escalation and the step counter keep running in standby (a person who falls while setting up is still caught). `Session(standby=True)`;
+  phone sessions (`/ws/session`) start in standby, the desktop session still counts from the start (unchanged). `request_start()` =
+  counters to 0 + counting on (applied by the feeder, reset first); `request_stop()` = back to standby (counts stay on screen).
+  Telemetry carries `counting`.
+- Triggers: voice "start my session" / "let's go" (`voicecmd.interpret`), socket commands `start_session` / `stop_session` (HUD
+  buttons), and for the desktop `POST /api/session/start|stop` (desktop routes, refused through a tunnel). "Stop session" by voice on a
+  phone still stops the camera (as before) and the next Start begins in standby again; on the desktop it pauses counting.
+- HUD (`remote/Hud.tsx`, shared by both modes): status pill, `READY — Say "Let's go" to start` (amber) / `ACTIVE` (green), large rep
+  counter (dimmed in standby), model badge/switcher, camera flip (phone), full-screen toggle, Start / Pause, fall pill, voice chip.
+  Only its buttons take taps. Start also closes the Exercise Guide.
+- Full screen (`remote/useFullscreen.ts`): Fullscreen API on the video wrapper, falling back to `fixed inset-0 z-40` where the
+  browser has none (iPhone Safari); body scroll locked and Esc exits in the fallback. The HUD is inside the wrapper so it stays
+  visible; the Exercise Guide and fall check are native modal dialogs (top layer) and sit above either kind.
+- Tests: +3 Python (standby pauses reps but not falls and start/pause flags; phone session standby and HUD commands over the socket;
+  desktop session routes + tunnel refusal). Expected 93 Python, 37 vitest (no new pure helper). The browser parts (HUD layout,
+  Fullscreen API, fallback) have not run.
+
+### Speed on phones: what was and was not changed (2026-11-17) — implemented, NOT yet measured
+
+Premise check: the phone runs NO pose model (it sends JPEG frames; YOLO and MediaPipe run on the server, blueprint Phase 6 is the
+on-device version), so a "mobile INT8 bundle", `modelComplexity` on the phone and "UI thread" inference do not exist yet.
+- YOLO (server GPU): FP16 (`half=True`) on CUDA devices, never on CPU; `YOLO_HALF=0` turns it off. INT8 was NOT done: it needs a
+  TensorRT / ONNX export with calibration data, costs keypoint accuracy (the rep counter depends on it), and cannot be validated here.
+  `YOLO_IMGSZ` (multiple of 32, default 640 unchanged) lets the network input match the phone's <= 480 px frames (about 45% less work).
+- MediaPipe: its three confidences were already 0.5. "Lite" (complexity 0) is now a selectable third model ("MediaPipe Lite" on the
+  badge and the desktop picker) for live comparison; it is faster but LESS accurate than Full, so it is not the default.
+- Resolution: the phone already sends at most 480 px on the long side (adaptive 320-480), under the requested 640x480; unchanged.
+- Throttle: the phone sends at most 20 frames/s (`canSendFrame`: min 50 ms gap, one frame in flight, overdue ack = resend). The server
+  already keeps only the newest frame per session, so a busy GPU skips frames instead of queueing.
+- The real limit through a tunnel is usually the round trip (one frame in flight = fps ~ 1 / round trip). The panel shows `round trip`
+  and the model's own `ms`: if `ms` is small and the round trip is large, no model change will help; the fixes are a closer server,
+  allowing 2 frames in flight, or on-device inference (Phase 6).
+- Tests: +2 Python (FP16 only on GPU and env settings; Lite selectable) -> 95 expected; +5 vitest -> 42 expected.
+
 ### Next: P2 persistence and upload mode
 
 SQLite + JSON report, recording mode A/B, H.264 recorder via imageio-ffmpeg, upload job worker process, session history with Recharts.

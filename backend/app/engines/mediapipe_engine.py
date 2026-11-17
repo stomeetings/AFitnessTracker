@@ -24,6 +24,7 @@ _MP_INDEX = {
 
 class MediaPipeEngine(PoseEngine):
     capabilities = Capabilities(has_3d=True, has_feet=True, native_bbox=False, device="cpu")
+    stateless = False       # VIDEO mode tracks the person between frames: one instance per patient, never shared
 
     def __init__(self, variant: str = "full", min_conf: float = 0.5):
         assert variant in ("lite", "full"), variant

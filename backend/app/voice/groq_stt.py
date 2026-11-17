@@ -32,9 +32,10 @@ def _speech_text(body: dict) -> str:
     return str(body.get("text", "")).strip()
 
 
-def transcribe(wav: bytes, key: str, post=None) -> str:
+def transcribe(wav: bytes, key: str, post=None, filename: str = "speech.wav", content_type: str = "audio/wav") -> str:
     """Returns the recognised text ("" when it is judged not to be speech). Raises SttError. `post` is injectable
-    for tests; by default it is requests.post.
+    for tests; by default it is requests.post. `filename` / `content_type` name the format of `wav`: the microphone
+    path sends WAV, a browser sends whatever its MediaRecorder produced (webm, mp4 ...).
 
     Deliberately no `prompt`: a prompt such as "I am okay" can be echoed back by Whisper on near-silent audio, which
     would cancel a real emergency."""
@@ -46,7 +47,7 @@ def transcribe(wav: bytes, key: str, post=None) -> str:
         post = requests.post
     try:
         r = post(URL, headers={"Authorization": f"Bearer {key}"},
-                 files={"file": ("speech.wav", wav, "audio/wav")},
+                 files={"file": (filename, wav, content_type)},
                  data={"model": MODEL, "language": "en", "temperature": "0", "response_format": "verbose_json"},
                  timeout=TIMEOUT_S)
     except Exception as e:  # noqa: BLE001  requests.RequestException, timeouts, DNS ...
