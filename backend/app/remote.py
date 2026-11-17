@@ -10,6 +10,11 @@ Wire protocol (one socket = one session; see docs/cloud_mobile_blueprint.md sect
                      ...the session's telemetry...}                      one per processed frame ("error" if it failed)
   client -> server  {"type":"cmd","name":"exercise","value":"Elbow Curl"} | "reset" | "ack_fall" | "escalate" | "test_fall"
   server -> client  {"type":"cmd_result","name":...,"ok":true|false,"error":...}
+  client -> server  {"type":"kp","seq":n,"t":capture_ms,"w":W,"h":H,"kp":{"l_shoulder":[x,y,conf],...}}
+      the pose computed ON THE PHONE (no video is sent): x, y in pixels of a W x H frame, conf 0..1, names from
+      engines.base.KEYPOINT_NAMES; "kp":{} = nobody in view. The server runs the same analytics on it (reps, falls, escalation)
+      and answers with the usual "t" telemetry, at most ~10 per second and WITHOUT "pose" (the phone already has it).
+      The client does not wait for answers: send at the model's own pace; only the newest waiting message is processed.
   client -> server  {"type":"audio","mime":"audio/webm;codecs=opus","data":"<base64>"}      one spoken utterance (<= 400 kB)
   server -> client  {"type":"voice","ok":true,"text":"...","intent":...}   or {"type":"voice","ok":false,"error":...,"status"?}
       intent while a fall check is open: "ok" (-> acknowledged) | "help" (-> escalated) | null
@@ -40,7 +45,10 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, WebSocket
 
+import math
+
 from app.engines import PoseResult
+from app.engines.base import KEYPOINT_NAMES, Keypoint, bbox_from_keypoints
 from app.inference import FrameResult, InferenceService
 from app.security import FailureLimiter, origin_allowed, token_ok
 from app.sessions import EXERCISE_NAMES, REFERENCE_LONG_SIDE, Session, SessionLimitError, SessionManager
@@ -53,6 +61,9 @@ HEADER = struct.Struct(">Id")       # frame number, capture time in ms: the byte
 MAX_FRAME_BYTES = 2_000_000
 MAX_TEXT_BYTES = 4096               # commands and the auth message are tiny
 AUDIO_PREFIX = '{"type":"audio"'    # the client writes the type first, so the (large) audio messages are told apart cheaply
+KP_PREFIX = '{"type":"kp"'          # likewise for keypoint messages (the pose computed on the phone)
+KP_REPLY_GAP_S = 0.1                # telemetry answers to keypoint messages: at most 10 a second
+MAX_FRAME_SIDE = 4096               # a believable frame size for a keypoint message
 MAX_AUDIO_TEXT = MAX_AUDIO_BYTES * 4 // 3 + 200      # an utterance base64 encoded, plus the JSON around it
 MAX_PENDING = 16                    # sockets accepted but not yet authenticated, so they cannot pile up
 CLOSE_UNAUTHORIZED = 4401           # application close code: token missing or wrong
@@ -75,9 +86,38 @@ def pose_payload(pose: PoseResult | None) -> dict | None:
             "bbox": [round(v, 1) for v in (b.x, b.y, b.w, b.h)]}
 
 
-def reply_for(session: Session, seq: int, result: FrameResult, width: int, height: int, engine: str | None = None) -> dict:
+def parse_keypoints(text: str) -> tuple[int, float, int, int, PoseResult | None]:
+    """A {"type":"kp",...} message -> (seq, capture time in ms, width, height, pose). The pose is None for "nobody in view" (an
+    empty "kp", or too few confident joints to outline a person, as the MediaPipe engine decides). Raises ValueError on anything
+    malformed: unknown joint names, non-numbers, absurd sizes."""
+    try:
+        msg = json.loads(text)
+        seq, t_ms = int(msg["seq"]), float(msg["t"])
+        width, height = int(msg["w"]), int(msg["h"])
+        raw = msg["kp"]
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise ValueError("bad keypoint message") from e
+    if not (1 <= width <= MAX_FRAME_SIDE and 1 <= height <= MAX_FRAME_SIDE) or not math.isfinite(t_ms) or not isinstance(raw, dict):
+        raise ValueError("bad keypoint message")
+    kps: dict[str, Keypoint] = {}
+    for name, value in raw.items():
+        if name not in KEYPOINT_NAMES:
+            raise ValueError(f"unknown joint {str(name)[:20]!r}")
+        try:
+            x, y, conf = (float(v) for v in value)
+        except (ValueError, TypeError):
+            raise ValueError("bad joint value") from None
+        if not all(math.isfinite(v) for v in (x, y, conf)):
+            raise ValueError("bad joint value")
+        kps[name] = Keypoint(x, y, min(1.0, max(0.0, conf)))
+    bbox = bbox_from_keypoints(kps, (height, width), 0.5) if kps else None
+    return seq, t_ms, width, height, (PoseResult(kps, bbox, int(t_ms)) if bbox is not None else None)
+
+
+def reply_for(session: Session, seq: int, result: FrameResult, width: int, height: int, engine: str | None = None,
+              include_pose: bool = True) -> dict:
     msg = {"type": "t", "ack": seq, "frame": {"w": width, "h": height}, "infer_ms": round(result.infer_ms, 1),
-           "pose": pose_payload(result.pose), **session.telemetry()}
+           **({"pose": pose_payload(result.pose)} if include_pose else {}), **session.telemetry()}
     if engine is not None:
         msg["engine"] = engine                  # the pose model in use right now, so the phone can show it
     if result.error:
@@ -237,6 +277,46 @@ def create_router(sessions: SessionManager, service: InferenceService, *, enable
             # the same path the desktop page's POST /api/voice takes: validation, Groq, intent
             await send(await loop.run_in_executor(None, process_audio, session, listener, raw, mime, voice_calls))
 
+        kp_last = [0.0]                                 # when the last keypoint answer went out (they are limited to ~10 a second)
+        kp_tasks: set[asyncio.Task] = set()
+
+        async def send_quietly(obj: dict) -> None:
+            try:
+                await send(obj)
+            except Exception:  # noqa: BLE001  the socket closed while the answer was on its way
+                pass
+
+        def kp_done(fut, seq: int, width: int, height: int) -> None:
+            """Runs on the event loop once the service has fed the session the phone's pose."""
+            try:
+                result = fut.result()
+            except Exception:  # noqa: BLE001
+                return
+            if result.dropped:                          # replaced by a newer pose, or the service is stopping
+                return
+            now = loop.time()
+            if not result.error and now - kp_last[0] < KP_REPLY_GAP_S:
+                return                                  # the phone does not need 30 telemetry answers a second
+            kp_last[0] = now
+            task = asyncio.ensure_future(send_quietly(reply_for(session, seq, result, width, height, service.engine_name,
+                                                                include_pose=False)))
+            kp_tasks.add(task)
+            task.add_done_callback(kp_tasks.discard)
+
+        async def handle_keypoints(text: str) -> None:
+            """The pose the phone computed itself: validated, then fed to the session like a server-inferred one. Never waits
+            for the answer (kp_done sends it), so the reader keeps up with a phone sending 30 poses a second."""
+            try:
+                seq, capture_ms, width, height, pose = parse_keypoints(text)
+            except ValueError as e:
+                now = loop.time()
+                if now - kp_last[0] >= KP_REPLY_GAP_S:  # a broken client must not flood the socket with errors either
+                    kp_last[0] = now
+                    await send({"type": "t", "ack": 0, "error": str(e)})
+                return
+            future = service.submit_pose(session, pose, capture_ms / 1000.0, width, height)
+            future.add_done_callback(lambda f: loop.call_soon_threadsafe(kp_done, f, seq, width, height))
+
         async def reader() -> None:
             try:
                 while True:
@@ -257,6 +337,9 @@ def create_router(sessions: SessionManager, service: InferenceService, *, enable
                                 await voice_fail("still processing the last sentence")
                             else:                                       # off the reader, so frames and commands keep flowing
                                 voice_task[0] = asyncio.create_task(handle_audio(text))
+                        elif text.startswith(KP_PREFIX):
+                            if len(text) <= MAX_TEXT_BYTES:
+                                await handle_keypoints(text)
                         elif len(text) <= MAX_TEXT_BYTES:
                             reply = run_command(session, text, service, engine_names())
                             if reply is not None:
@@ -284,6 +367,7 @@ def create_router(sessions: SessionManager, service: InferenceService, *, enable
         finally:
             if voice_task[0] is not None:
                 tasks.append(voice_task[0])
+            tasks.extend(kp_tasks)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

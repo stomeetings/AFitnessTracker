@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { LANDMARK_JOINTS, MAX_LOCAL_FPS, ON_DEVICE, bboxFromKeypoints, canRunInference, defaultInference, isMobileDevice, keypointMessage, landmarksToKeypoints } from "./logic";
 import { ACK_TIMEOUT_MS, MAX_QUALITY, MIN_FRAME_GAP_MS, MIN_QUALITY, SKELETON, canSendFrame, captureSize, drawPose, engineLabel, extractToken, fitContain, isLocalHost, nextEngine, nextQuality, packFrame, reconnectDelay, type Pose } from "./logic";
 
 const bytes = (b: ArrayBuffer) => Array.from(new Uint8Array(b));
@@ -55,6 +56,75 @@ describe("canSendFrame (the send throttle)", () => {
   });
   it("allows the very first frame", () => {
     expect(canSendFrame(10_000, 0, false)).toBe(true);
+  });
+});
+
+describe("on-device pose helpers", () => {
+  const lm = (x: number, y: number, visibility?: number) => ({ x, y, visibility });
+  const person = () => {                                              // 33 landmarks; only the mapped ones matter
+    const all = Array.from({ length: 33 }, () => lm(0, 0, 0));
+    all[11] = lm(0.4, 0.3, 0.98); all[12] = lm(0.6, 0.3, 0.97); all[23] = lm(0.42, 0.55, 0.96); all[24] = lm(0.58, 0.55, 0.9);
+    all[25] = lm(0.42, 0.75, 0.2); all[0] = lm(0.5, 0.15);             // a knee that is hard to see; a nose with no visibility
+    return all;
+  };
+
+  it("maps the 33 landmarks onto the 17 joint names, in pixels of the frame", () => {
+    const kp = landmarksToKeypoints(person(), 1280, 720);
+    expect(Object.keys(kp)).toHaveLength(17);
+    expect(kp.l_shoulder).toEqual([512, 216, 0.98]);                   // 0.4 * 1280, 0.3 * 720
+    expect(kp.r_hip).toEqual([742.4, 396, 0.9]);
+    expect(kp.l_knee[2]).toBe(0.2);
+    expect(kp.nose[2]).toBe(0);                                         // no visibility = no confidence
+    expect(kp.l_shoulder).not.toBe(kp.r_shoulder);
+    expect(Object.values(LANDMARK_JOINTS)).toContain("r_foot_index");
+  });
+  it("copes with fewer landmarks than expected", () => {
+    expect(Object.keys(landmarksToKeypoints([lm(0.5, 0.5, 1)], 100, 100))).toEqual(["nose"]);
+    expect(landmarksToKeypoints([], 100, 100)).toEqual({});
+  });
+
+  it("outlines the confident joints, and nothing when there are too few", () => {
+    const box = bboxFromKeypoints(landmarksToKeypoints(person(), 1000, 1000));
+    expect(box).not.toBeNull();
+    const [x, y, w, h] = box!;
+    expect(x).toBeLessThan(400); expect(x + w).toBeGreaterThan(600);   // spans the shoulders and hips (the weak knee is left out)
+    expect(y).toBeLessThan(300); expect(y + h).toBeGreaterThan(550);
+    expect(bboxFromKeypoints({ a: [1, 2, 0.9], b: [3, 4, 0.9] })).toBeNull();
+  });
+
+  it("writes the message the server reads: type first, rounded time, the joints", () => {
+    const text = keypointMessage(5, 1234.56, 640, 480, { l_hip: [1, 2, 0.5] });
+    expect(text.startsWith('{"type":"kp"')).toBe(true);                // the server's prefix check
+    expect(JSON.parse(text)).toEqual({ type: "kp", seq: 5, t: 1234.6, w: 640, h: 480, kp: { l_hip: [1, 2, 0.5] } });
+    expect(text.length).toBeLessThan(4096);                            // the server refuses longer text messages
+    expect(keypointMessage(1, 0, 1280, 720, landmarksToKeypoints(person(), 1280, 720)).length).toBeLessThan(1000);
+  });
+
+  it("caps the on-device loop at 30 per second", () => {
+    expect(canRunInference(33.4, 0)).toBe(true);                       // a 30 fps camera's next frame
+    expect(canRunInference(16.7, 0)).toBe(false);                      // a 60 Hz display tick in between
+    expect(canRunInference(1000, 969)).toBe(true);
+    expect(MAX_LOCAL_FPS).toBe(30);
+  });
+
+  it("recognises phones and tablets, and defaults them to on-device pose", () => {
+    const iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1";
+    const android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36";
+    const ipadOs = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15";
+    const desktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
+    expect(isMobileDevice(iphone, 5)).toBe(true);
+    expect(isMobileDevice(android, 5)).toBe(true);
+    expect(isMobileDevice(ipadOs, 5)).toBe(true);                      // iPadOS pretends to be a Mac, but it has a touch screen
+    expect(isMobileDevice(ipadOs, 0)).toBe(false);                     // a real Mac
+    expect(isMobileDevice(desktop, 0)).toBe(false);
+    expect(defaultInference(true)).toBe("device");
+    expect(defaultInference(false)).toBe("server");
+  });
+
+  it("lists the on-device model beside the server's in the badge's cycle", () => {
+    expect(engineLabel(ON_DEVICE)).toBe("On-device MediaPipe");
+    expect(nextEngine(ON_DEVICE, [ON_DEVICE, "mediapipe", "yolo"])).toBe("mediapipe");
+    expect(nextEngine("yolo", [ON_DEVICE, "mediapipe", "yolo"])).toBe(ON_DEVICE);
   });
 });
 

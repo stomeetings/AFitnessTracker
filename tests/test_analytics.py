@@ -1957,11 +1957,134 @@ def test_the_desktop_session_buttons_start_and_pause_counting():
     assert main.local_session.pending_counting is None
 
 
+def _kp(pose):
+    return {n: [round(k.x, 1), round(k.y, 1), round(k.conf, 2)] for n, k in pose.keypoints.items()}
+
+
+def _kp_text(pose, seq=1, t=100.0, w=640, h=480, kp=None):
+    return json.dumps({"type": "kp", "seq": seq, "t": t, "w": w, "h": h, "kp": _kp(pose) if kp is None else kp},
+                      separators=(",", ":"))
+
+
+def test_keypoint_messages_from_a_phone_are_validated():
+    from app.remote import KP_PREFIX, parse_keypoints
+    text = _kp_text(_pose(240, 0), seq=7, t=1234.5)
+    assert text.startswith(KP_PREFIX)                                          # how the gateway tells them from commands
+    seq, t, w, h, pose = parse_keypoints(text)
+    assert (seq, t, w, h) == (7, 1234.5, 640, 480)
+    assert set(pose.keypoints) == set(_pose(240, 0).keypoints) and pose.bbox.w > 0 and pose.keypoints["l_hip"].x == 305.0
+    assert parse_keypoints(_kp_text(None, kp={}))[4] is None                   # nobody in view
+    two = {"l_hip": [300, 200, 0.9], "r_hip": [330, 200, 0.9]}
+    assert parse_keypoints(_kp_text(None, kp=two))[4] is None                  # too few joints to outline a person
+    loud = _kp(_pose(240, 0))
+    loud["l_hip"][2] = 7
+    assert parse_keypoints(_kp_text(None, kp=loud))[4].keypoints["l_hip"].conf == 1.0       # confidence is clamped
+    bad = ['{"type":"kp"}', "not json", _kp_text(None, kp={"tail": [1, 2, 0.9]}), _kp_text(None, kp={"l_hip": [1, 2]}),
+           _kp_text(None, kp={"l_hip": ["a", 2, 0.5]}), _kp_text(None, w=0, kp={}), _kp_text(None, w=99999, kp={}),
+           '{"type":"kp","seq":1,"t":1,"w":640,"h":480,"kp":{"l_hip":[1e999,2,0.5]}}',      # not a finite number
+           '{"type":"kp","seq":1,"t":1,"w":640,"h":480,"kp":[1,2]}']
+    for text in bad:
+        try:
+            parse_keypoints(text)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted: {text[:60]}")
+
+
+def test_a_pose_computed_on_the_phone_feeds_the_session_even_with_no_engine_loaded():
+    service = _started_service(_EngineFactory(), engine_name="broken", fallback="broken")      # nothing loads
+    try:
+        s = Session("s")
+        for i in range(1, int(5.5 * FPS) + 1):                                 # lying on the floor, as the phone's model saw it
+            r = service.submit_pose(s, FLOOR, i / FPS, 640, 480).result(5)
+            assert r.error is None and not r.dropped and r.infer_ms == 0.0     # no server time spent
+        assert s.telemetry()["fall"]["alert"]["state"] == "COUNTDOWN"          # the fall pipeline ran on it
+        r = service.submit_pose(Session("n"), None, 0.1, 640, 480).result(5)   # "nobody in view" is a result too
+        assert r.pose is None and r.error is None
+    finally:
+        service.stop()
+
+
+def test_poses_and_frames_share_a_cycle_but_only_frames_reach_the_engine():
+    gate = threading.Event()
+    factory = _EngineFactory(gate=gate)
+    service = _started_service(factory)
+    try:
+        engine = factory.made[0]
+        busy = service.submit(Session("busy"), _frame(FRAME_STANDING), 0.1)
+        assert engine.entered.wait(5)
+        s1, s2 = Session("frames"), Session("poses")
+        f1 = service.submit(s1, _frame(FRAME_STANDING), 0.2)
+        f2 = service.submit_pose(s2, _pose(240, 0), 0.2, 640, 480)
+        gate.set()
+        busy.result(5)
+        r1, r2 = f1.result(5), f2.result(5)
+        assert engine.batches == [1, 1], engine.batches                        # the pose never went to the engine
+        assert r1.error is None and r2.error is None and r2.batch_size == 2 and r2.infer_ms == 0.0
+        assert s1.pose_visible and s2.pose_visible                             # both sessions were fed
+    finally:
+        service.stop()
+
+
+def test_a_phone_that_runs_the_model_itself_sends_only_keypoints():
+    from fastapi.testclient import TestClient
+    service = _started_service(_EngineFactory())
+    try:
+        client = TestClient(_remote_app(service, SessionManager()))
+        with client.websocket_connect("/ws/session") as ws:
+            ws.receive_json()
+            n = [0]
+
+            def send_pose(pose=None, kp=None):
+                n[0] += 1
+                ws.send_text(_kp_text(pose or _pose(240, 0), seq=n[0], t=n[0] * 50.0, kp=kp))
+
+            def answer():
+                time.sleep(0.12)                                               # answers are limited to ~10 a second
+                send_pose()
+                return ws.receive_json()
+            send_pose()
+            first = ws.receive_json()
+            assert first["type"] == "t" and "pose" not in first                # the phone already has its own pose
+            assert first["frame"] == {"w": 640, "h": 480} and first["infer_ms"] == 0.0 and first["pose_visible"] is True
+            assert first["counting"] is False                                   # a phone session starts in standby
+            ws.send_json({"type": "cmd", "name": "start_session"})
+            assert ws.receive_json() == {"type": "cmd_result", "name": "start_session", "ok": True}
+            assert _wait_until(lambda: answer()["counting"] is True)
+            time.sleep(0.12)
+            send_pose(kp={"tail": [1, 2, 0.9]})                                # a broken message is refused, not fatal
+            assert ws.receive_json()["error"].startswith("unknown joint")
+            assert answer()["counting"] is True
+    finally:
+        service.stop()
+
+
+def test_the_browser_model_route_serves_only_the_two_pose_models():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    client = TestClient(main.app)
+    for name in ("yolo11n-pose.pt", "nope.task", "..%2Fapp%2Fmain.py", "pose_landmarker_heavy.task"):
+        assert client.get(f"/models/{name}").status_code == 404, name
+    path = main.MODELS_DIR / "pose_landmarker_lite.task"
+    r = client.get("/models/pose_landmarker_lite.task")
+    if path.is_file():
+        assert r.status_code == 200 and "max-age" in r.headers["cache-control"] and len(r.content) > 1000
+    else:
+        assert r.status_code == 404
+    via = client.get("/models/pose_landmarker_lite.task", headers={"x-forwarded-for": "203.0.113.9"})
+    assert via.status_code == r.status_code                                    # a public file, not a desktop route
+    assert client.get("/models/yolo11n-pose-320.onnx").status_code == 404      # the removed client-side YOLO model is not served
+
+
 def test_yolo_uses_fp16_only_on_a_gpu_and_the_engine_settings_come_from_the_environment():
     from app.engines.yolo_engine import YoloEngine
     assert YoloEngine(device="cuda:0").half is True                          # FP16 by default on the GPU
     assert YoloEngine(device="cuda:0", half=False).half is False
     assert YoloEngine(device="cpu").half is False                            # the CPU has no half precision: never asked for
+    assert YoloEngine(device="cpu")._precision_args() == {}
+    fp16 = YoloEngine(device="cuda:0")._precision_args()                     # whichever name the installed Ultralytics understands:
+    assert fp16 in ({"quantize": 16}, {"half": True})                        # `half` alone would warn on every single frame there
+    assert YoloEngine(device="cuda:0", half=False)._precision_args() == {}
     import app.main as main
     saved = {k: os.environ.get(k) for k in ("YOLO_IMGSZ", "YOLO_HALF")}
     try:

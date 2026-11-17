@@ -45,10 +45,13 @@ class FrameResult:
 @dataclass
 class _Slot:
     session: Session
-    frame: np.ndarray
+    frame: np.ndarray | None            # None for a precomputed pose (the browser ran the model itself)
     t: float
     seq: int
     future: Future
+    precomputed: bool = False           # `given` is the pose: no engine is involved
+    given: PoseResult | None = None     # None here means "nobody in view", as a result of detection would
+    size: tuple[int, int] | None = None  # (width, height) of the frame a precomputed pose belongs to
 
 
 class InferenceService:
@@ -109,11 +112,21 @@ class InferenceService:
     def submit(self, session: Session, frame: np.ndarray, t: float) -> Future:
         """Queue a frame (t = its capture time in seconds). The future resolves to a FrameResult once the frame has been
         inferred and the session fed. Never blocks. A newer frame of the same session replaces a waiting one."""
+        return self._enqueue(session, lambda seq, future: _Slot(session, frame, t, seq, future))
+
+    def submit_pose(self, session: Session, pose: PoseResult | None, t: float, width: int, height: int) -> Future:
+        """Queue a pose that was ALREADY computed (the browser ran the model on the phone): the session's analytics (reps, falls,
+        escalation) run on it exactly as on a server-inferred one, with no engine involved, so it also works when no engine is
+        loaded. `pose` is in pixels of a width x height frame; None = nobody in view. Same latest-wins rule as submit()."""
+        return self._enqueue(session, lambda seq, future: _Slot(session, None, t, seq, future, precomputed=True, given=pose,
+                                                                size=(width, height)))
+
+    def _enqueue(self, session: Session, make_slot) -> Future:
         future: Future = Future()
         with self._lock:
             self._seq += 1
             old = self._slots.get(session.id)
-            self._slots[session.id] = _Slot(session, frame, t, self._seq, future)      # keeps its place in the order
+            self._slots[session.id] = make_slot(self._seq, future)      # keeps its place in the order
             self._sessions[session.id] = session
         if old is not None:
             self.stats["dropped"] += 1
@@ -217,6 +230,9 @@ class InferenceService:
         errors: list[str | None] = [None] * len(batch)
         groups: dict[int, tuple[PoseEngine, list[int]]] = {}
         for i, slot in enumerate(batch):
+            if slot.precomputed:                    # the pose came with the message: nothing to infer
+                poses[i] = slot.given
+                continue
             try:
                 engine = self._engine_for(slot.session)
             except Exception as e:  # noqa: BLE001
@@ -246,13 +262,14 @@ class InferenceService:
         self.stats["batches"] += 1
         self.stats["frames"] += len(batch)
         for slot, pose, error in zip(batch, poses, errors):
-            result = FrameResult(slot.seq, pose, infer_ms, batch_size=len(batch), error=error)
+            own_ms = 0.0 if slot.precomputed else infer_ms      # no server time was spent on a pose the phone computed
+            result = FrameResult(slot.seq, pose, own_ms, batch_size=len(batch), error=error)
             if error is None:
                 began = time.perf_counter()
-                height, width = slot.frame.shape[:2]
+                width, height = slot.size if slot.size is not None else (slot.frame.shape[1], slot.frame.shape[0])
                 try:
                     slot.session.apply_pending()
-                    slot.session.process(pose, slot.t, infer_ms=infer_ms, frame_width=width, frame_height=height)
+                    slot.session.process(pose, slot.t, infer_ms=own_ms, frame_width=width, frame_height=height)
                 except Exception as e:  # noqa: BLE001  one session's failure stays with that session
                     log.exception("session %s: processing a frame failed", slot.session.id)
                     result.error = f"session error: {type(e).__name__}"

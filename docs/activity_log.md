@@ -832,6 +832,79 @@ on-device version), so a "mobile INT8 bundle", `modelComplexity` on the phone an
   allowing 2 frames in flight, or on-device inference (Phase 6).
 - Tests: +2 Python (FP16 only on GPU and env settings; Lite selectable) -> 95 expected; +5 vitest -> 42 expected.
 
+### Phase 6: pose model on the phone, only joints sent (2026-11-17) — implemented, NOT yet run
+
+Decision (deviates from the request on one point): the model runs on the phone, but rep counting, fall detection and escalation STAY
+on the server's pipeline and receive the phone's keypoints. Re-implementing them in TypeScript would have meant two copies of
+safety-critical logic (falls) that can drift apart. The goal (no video over the tunnel, no round trip before the skeleton appears)
+is met: the skeleton is drawn from the phone's own pass; telemetry (reps, ACTIVE/READY, fall state) arrives at ~10 per second and
+nothing waits for it. The server is not "only synced at rep increments": it needs the pose stream to count reps and watch for falls.
+- Phone: `@mediapipe/tasks-vision` 0.10.14 (exact pin: its WebAssembly is loaded from jsDelivr at the same version), imported on demand;
+  Lite model (complexity 0), VIDEO mode, GPU delegate then CPU, confidences 0.5, model from `/models/...` on this server (cached a week)
+  then Google's host; `requestAnimationFrame` loop on NEW video frames, max 30 per second; 33 landmarks -> the 17 joint names the server
+  already uses (`LANDMARK_JOINTS`); skeleton drawn straight onto the canvas (not through React state). If it cannot start or the model
+  throws, the page falls back to sending frames (message shown; not remembered).
+- Wire: `{"type":"kp","seq","t","w","h","kp":{joint:[x,y,conf]}}` (about 0.6 kB, never queued: skipped while the socket's send buffer
+  is above 64 kB). Server: `parse_keypoints` validates (joint names from `engines.base.KEYPOINT_NAMES`, finite numbers, sane size),
+  `InferenceService.submit_pose` feeds the session through the same batch cycle with NO engine involved (works even if no server engine
+  loaded), replies at most 10 per second and without `pose`. Standby, HUD, voice, falls: unchanged.
+- Default: on-device on phones/tablets (`isMobileDevice`), server models elsewhere; the badge cycles `On-device MediaPipe -> MediaPipe
+  -> MediaPipe Lite -> YOLO` and remembers the choice. The badge shows `fps · ms` of the local model.
+- Server also serves `/models/pose_landmarker_{lite,full}.task` (exact names only) from `backend/models/`; the service worker skips it.
+- Tests: +5 Python (keypoint validation; submit_pose with no engine; poses and frames in one cycle; keypoint messages over the socket
+  with standby start/stop and a bad message; the model route) -> 100 expected; +7 vitest -> 49 expected.
+- Limits: needs WebAssembly and (for speed) WebGL in the phone's browser; a hidden tab pauses `requestAnimationFrame`, so on-device pose
+  (and falls) stop while the page is in the background, as for frames before; the full-precision model is not offered on the phone.
+- To verify: `npm install` (new dependency), the usual checks, then on the phone: the badge should say `On-device MediaPipe`, 25-30 fps
+  and a few ms to tens of ms; check the HUD counts reps after "let's go" and the Network tab shows only small text frames, no JPEGs.
+
+### Client-side YOLO in the model switcher (2026-11-17) — REVERTED the same day, see "Client-side YOLO removed" below
+
+- Third on-device option beside MediaPipe: **On-device YOLO** (YOLO11n-pose through ONNX Runtime Web; WebGPU, else WebGL, else
+  WebAssembly, each tried with a warm-up run so a provider that cannot run every operator falls through to the next). The badge now
+  cycles `On-device MediaPipe -> On-device YOLO -> MediaPipe -> MediaPipe Lite -> YOLO` (the last three on the server). Same wire
+  format as MediaPipe (`kp` messages), same server pipeline; YOLO gives the 13 COCO joints (no feet), as the server's own YOLO does.
+- Input is letterboxed to 320 x 320 before the network (`YOLO_INPUT`, `letterbox`), one reused buffer and canvas (no per-frame
+  allocation), single-threaded WebAssembly (more threads need cross-origin isolation); the output is decoded by `decodeYoloPose`
+  (best-scoring person, mapped back to the video frame's pixels, either output layout).
+- Detector abstraction (`onDevicePose.ts` `Detector`, `createDetector`): the loop now supports asynchronous detectors, skips frames
+  while a detection runs (never queues), and reports fps, ms and a `slow` verdict (below 12 fps, with hysteresis, after 2 s of
+  warm-up). Slow shows an amber model badge and an amber "Slow on this device" pill; it does NOT switch models by itself, so the
+  comparison stays yours. Load or run failures fall back to server frames with the reason shown (as for MediaPipe).
+- The ONNX file is NOT in the repository: run `backend/.venv/Scripts/python backend/scripts/export_onnx.py` (320, FP32, opset 12,
+  about 11 MB; `--size 480` for another). The backend serves `/models/yolo11n-pose-{320,480}.onnx` (exact names only); without the file
+  the page says so and uses the server. INT8 / FP16 are not done: FP16 cannot run on onnxruntime-web's WebAssembly provider, INT8 needs
+  calibration images and costs keypoint accuracy that the rep counter relies on.
+- ONNX Runtime Web is loaded from jsDelivr at a pinned version (1.20.1; `ort.all.min.mjs`), not installed with npm, so the build does
+  not bundle it; the file name and version were written from memory and are unverified.
+- Tests: +7 vitest (letterbox, decoding in both layouts, joint names, threshold, bad shapes, slow verdict, mode mapping) -> 56 expected;
+  the model-route test also covers the ONNX names. Python stays 100.
+
+### Fixes found while exporting the ONNX model (2026-11-17)
+
+- The export failed on this machine because Ultralytics' automatic install of `onnx` / `onnxruntime` / `onnxslim` (via `uv`) is refused
+  by the network's HTTPS certificate ("invalid peer certificate: UnknownIssuer"). Install them yourself: `uv pip install --system-certs
+  --python backend/.venv/Scripts/python.exe "onnx>=1.12,<2" onnxruntime onnxslim`, then rerun `export_onnx.py` (documented in the script).
+- Real bug in the earlier FP16 change: Ultralytics 8.4 deprecates `half` (it maps to `quantize=16`) and prints "'half' is deprecated" on
+  EVERY call, so the server's YOLO would have logged that warning on every frame. `YoloEngine._precision_args()` now passes
+  `quantize=16` when the installed Ultralytics knows it, `half=True` for older ones. The export script no longer passes `half` either.
+
+### Client-side YOLO removed (2026-11-17)
+
+On the phone it lagged badly, so it is gone and the on-device pipeline is back to MediaPipe only.
+- Removed: the `device_yolo` mode and badge entry, the ONNX Runtime Web loader, YOLO letterbox / output decoding, the slow-device
+  warning (it was added together with YOLO), `/models/yolo11n-pose-*.onnx` from the model route (now only the two MediaPipe files),
+  and the 7 vitest cases for them.
+- Restored to their pre-YOLO form: `onDevicePose.ts` (the detector abstraction and the asynchronous loop with its `busy` gate and
+  warm-up bookkeeping went too, so the loop is exactly the one that felt smooth), the on-device parts of `useRemoteSession.ts`,
+  `RemoteView.tsx` and `Hud.tsx`, and the two-value `InferenceMode` ("device" | "server") in `logic.ts`.
+- KEPT, because it has nothing to do with the browser: the server-side YOLO FP16 fix (`YoloEngine._precision_args()` passes
+  `quantize=16`, or `half` on older Ultralytics, instead of a `half` that Ultralytics 8.4 warns about on every frame).
+- Files to delete by hand (they could not be deleted from the assistant's session, and were emptied): `frontend/src/remote/onDeviceYolo.ts`,
+  `backend/scripts/export_onnx.py`, and the generated `backend/models/yolo11n-pose-320.onnx` (git-ignored). The Python packages
+  `onnx`, `onnxruntime`, `onnxslim` (+ `protobuf`, `ml-dtypes`, `colorama`) installed for the export can be removed too.
+- Expected: 100 Python tests, 49 vitest.
+
 ### Next: P2 persistence and upload mode
 
 SQLite + JSON report, recording mode A/B, H.264 recorder via imageio-ffmpeg, upload job worker process, session history with Recharts.

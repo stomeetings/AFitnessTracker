@@ -76,9 +76,65 @@ export function extractToken(search: string): { token: string | null; rest: stri
 /** Phones and tunnels open this page on a real host name; only the laptop itself uses localhost. */
 export const isLocalHost = (hostname: string) => ["localhost", "127.0.0.1", "[::1]", "::1"].includes(hostname);
 
+// ---- On-device pose (MediaPipe running in this browser; only joint positions are sent) ----------------------------------------
+
+/** The pseudo-model name for "the phone runs the model": it sits beside the server models ("yolo" ...) in the badge's list. */
+export const ON_DEVICE = "device";
+export type Keypoints = Record<string, [number, number, number]>;
+export type InferenceMode = "device" | "server";
+
+export const MAX_LOCAL_FPS = 30;                                  // the camera delivers 30 at most; more would only burn battery
+export const MIN_LOCAL_GAP_MS = 1000 / MAX_LOCAL_FPS - 3;         // a little slack: a 30 fps camera's frames are 33.3 ms apart
+
+/** Whether the on-device loop may run another inference now (at most MAX_LOCAL_FPS; frames in between are skipped). */
+export const canRunInference = (now: number, last: number): boolean => now - last >= MIN_LOCAL_GAP_MS;
+
+/** MediaPipe landmark index -> the joint name the server's pipeline uses (the same table as the server's MediaPipe engine). */
+export const LANDMARK_JOINTS: Readonly<Record<number, string>> = {
+  0: "nose",
+  11: "l_shoulder", 12: "r_shoulder", 13: "l_elbow", 14: "r_elbow", 15: "l_wrist", 16: "r_wrist",
+  23: "l_hip", 24: "r_hip", 25: "l_knee", 26: "r_knee", 27: "l_ankle", 28: "r_ankle",
+  29: "l_heel", 30: "r_heel", 31: "l_foot_index", 32: "r_foot_index",
+};
+
+/** The 33 normalised landmarks (x, y in 0..1) as the 17 named joints in pixels of the w x h video frame, rounded to keep the
+ *  message small. `visibility` is the confidence; a missing one counts as 0. */
+export function landmarksToKeypoints(landmarks: ReadonlyArray<{ x: number; y: number; visibility?: number }>, w: number, h: number): Keypoints {
+  const out: Keypoints = {};
+  for (const [index, name] of Object.entries(LANDMARK_JOINTS)) {
+    const lm = landmarks[Number(index)];
+    if (!lm) continue;
+    out[name] = [Math.round(lm.x * w * 10) / 10, Math.round(lm.y * h * 10) / 10, Math.round((lm.visibility ?? 0) * 100) / 100];
+  }
+  return out;
+}
+
+/** Bounding box [x, y, w, h] of the confident joints, padded; null with fewer than 4 (no person to outline). For drawing only:
+ *  the server works out its own. */
+export function bboxFromKeypoints(kp: Keypoints, minConf = 0.5, pad = 0.05): [number, number, number, number] | null {
+  const pts = Object.values(kp).filter((p) => p[2] >= minConf);
+  if (pts.length < 4) return null;
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const px = (x1 - x0) * pad, py = (y1 - y0) * pad;
+  return [x0 - px, y0 - py, x1 - x0 + 2 * px, y1 - y0 + 2 * py];
+}
+
+/** The `kp` message the server's gateway expects (backend/app/remote.py). `"type":"kp"` must come first: the server tells these
+ *  messages apart by that prefix. */
+export const keypointMessage = (seq: number, tMs: number, w: number, h: number, kp: Keypoints): string =>
+  JSON.stringify({ type: "kp", seq, t: Math.round(tMs * 10) / 10, w, h, kp });
+
+/** A phone or tablet (iPadOS reports itself as a Mac with a touch screen). */
+export const isMobileDevice = (userAgent: string, maxTouchPoints: number): boolean =>
+  /Android|iPhone|iPad|iPod|Mobile/i.test(userAgent) || (/Macintosh/.test(userAgent) && maxTouchPoints > 1);
+
+/** On-device pose is the default on phones (no video over the network), the server's models elsewhere. */
+export const defaultInference = (mobile: boolean): InferenceMode => (mobile ? "device" : "server");
+
 /** Short name of a pose model for badges ("yolo" -> "YOLO"). Unknown names are shown as they are. */
 export const engineLabel = (name: string): string =>
-  ({ yolo: "YOLO", mediapipe: "MediaPipe", mediapipe_lite: "MediaPipe Lite" } as Record<string, string>)[name] ?? name;
+  ({ yolo: "YOLO", mediapipe: "MediaPipe", mediapipe_lite: "MediaPipe Lite", device: "On-device MediaPipe" } as Record<string, string>)[name] ?? name;
 
 /** The model a tap on the badge switches to: the next one in the server's list after `current` (wrapping). Null when there is
  *  nothing to switch to (an empty or one-item list). */

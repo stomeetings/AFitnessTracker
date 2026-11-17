@@ -27,22 +27,32 @@ class YoloEngine(PoseEngine):
         # FP16 on a CUDA GPU: about twice the speed for practically the same keypoints. (INT8 needs TensorRT calibration and
         # costs keypoint accuracy; on a GPU FP16 is the right trade.) CPU has no half precision, so it is never asked for there.
         self.half = bool(half and device.startswith("cuda"))
+        self._precision: dict = {}              # the keyword that asks Ultralytics for FP16; worked out in load() (needs the import)
         self.name = f"yolo11n-pose-{device.split(':')[0]}"
         self.capabilities = Capabilities(has_3d=False, has_feet=False, native_bbox=True, device=device)
         self._model = None
+
+    def _precision_args(self) -> dict:
+        """FP16 as keyword arguments for predict(). Newer Ultralytics calls it `quantize=16` and deprecates `half`, and WARNS ON EVERY
+        CALL that `half` is deprecated (it would flood the log at 20+ frames a second), while older versions only know `half`."""
+        if not self.half:
+            return {}
+        from ultralytics.utils import DEFAULT_CFG_DICT
+        return {"quantize": 16} if "quantize" in DEFAULT_CFG_DICT else {"half": True}
 
     def load(self) -> None:
         from ultralytics import YOLO  # slow import, keep it lazy
         if not self.weights.exists():
             raise FileNotFoundError(f"{self.weights} missing; run scripts/download_models.py")
+        self._precision = self._precision_args()
         self._model = YOLO(str(self.weights))
         self._model.to(self.device)
         # warm-up: the first predict pays for CUDA/cuDNN init and model fusing; do it here, not on a live frame
-        self._model.predict(np.zeros((480, 640, 3), np.uint8), device=self.device, imgsz=self.imgsz, half=self.half, verbose=False)
+        self._model.predict(np.zeros((480, 640, 3), np.uint8), device=self.device, imgsz=self.imgsz, verbose=False, **self._precision)
 
     def infer(self, frame_bgr: np.ndarray, timestamp_ms: int) -> PoseResult | None:
-        r = self._model.predict(frame_bgr, device=self.device, imgsz=self.imgsz, conf=self.min_conf, half=self.half,
-                                verbose=False)[0]
+        r = self._model.predict(frame_bgr, device=self.device, imgsz=self.imgsz, conf=self.min_conf, verbose=False,
+                                **self._precision)[0]
         return self._to_pose(r, timestamp_ms)
 
     def infer_batch(self, frames_bgr, timestamps_ms) -> list[PoseResult | None]:
@@ -50,7 +60,7 @@ class YoloEngine(PoseEngine):
         if not len(frames_bgr):
             return []
         results = self._model.predict(list(frames_bgr), device=self.device, imgsz=self.imgsz, conf=self.min_conf,
-                                      half=self.half, verbose=False)
+                                      verbose=False, **self._precision)
         return [self._to_pose(r, ts) for r, ts in zip(results, timestamps_ms)]
 
     def _to_pose(self, r, timestamp_ms: int) -> PoseResult | None:

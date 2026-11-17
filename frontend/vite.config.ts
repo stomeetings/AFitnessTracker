@@ -9,6 +9,7 @@ const allowedHosts = [".trycloudflare.com", ".ngrok-free.app", ".ngrok-free.dev"
 // The Host header is deliberately NOT rewritten (no changeOrigin): the backend compares the browser's Origin with it.
 const proxy = {
   "/api": "http://127.0.0.1:8000",
+  "/models": "http://127.0.0.1:8000",      // the pose model for on-device inference
   "/ws": { target: "ws://127.0.0.1:8000", ws: true },
 };
 

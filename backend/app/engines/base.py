@@ -26,6 +26,14 @@ SKELETON = (
 )
 
 
+# Every joint name a pose can carry (the MediaPipe set; YOLO's COCO joints are a subset). A browser that runs the pose model
+# itself may send only these.
+KEYPOINT_NAMES = frozenset({
+    "nose", "l_shoulder", "r_shoulder", "l_elbow", "r_elbow", "l_wrist", "r_wrist", "l_hip", "r_hip",
+    "l_knee", "r_knee", "l_ankle", "r_ankle", "l_heel", "r_heel", "l_foot_index", "r_foot_index",
+})
+
+
 @dataclass
 class Keypoint:
     x: float            # image pixels

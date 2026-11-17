@@ -3,7 +3,7 @@ import { AlertTriangle, Cpu, Loader2, Maximize2, Minimize2, Pause, Play, SwitchC
 import type { Limb } from "../useTelemetry";
 import { engineLabel } from "./logic";
 
-export type HudModel = { name: string; ms: number; other: string | null; wanted: string | null; onSwitch: () => void };
+export type HudModel = { name: string; ms: number; fps?: number; other: string | null; wanted: string | null; onSwitch: () => void };
 
 export type HudProps = {
   status: string;                                       // "LIVE · standing", "Camera off" ...
@@ -55,10 +55,12 @@ export function Hud(p: HudProps) {
         <div className="flex flex-wrap items-center justify-end gap-2">
           {p.model && (
             <button onClick={p.model.onSwitch} disabled={!p.model.other || p.model.wanted !== null} className={btn}
-              title="Pose model in use. Tap to switch (applies to the whole server)">
+              title="Pose model in use. Tap to switch the model (the on-device one only affects this phone; a server one the whole server)">
               {p.model.wanted ? <Loader2 size={14} className="animate-spin text-emerald-400" /> : <Cpu size={14} className="text-emerald-400" />}
               <span className="font-semibold">{engineLabel(p.model.name)}</span>
-              {p.model.ms > 0 && !p.model.wanted && <span className="tabular-nums text-slate-400">{p.model.ms} ms</span>}
+              {p.model.ms > 0 && !p.model.wanted && (
+                <span className="tabular-nums text-slate-400">{p.model.fps ? `${p.model.fps} fps · ` : ""}{p.model.ms} ms</span>
+              )}
               {p.model.wanted && <span className="text-slate-400">→ {engineLabel(p.model.wanted)}…</span>}
             </button>
           )}

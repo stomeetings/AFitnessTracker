@@ -25,7 +25,7 @@ from pathlib import Path
 from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -471,6 +471,22 @@ def mjpeg():
 @app.get("/api/video_feed")
 def video_feed():
     return StreamingResponse(mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+BROWSER_MODELS = {"pose_landmarker_lite.task", "pose_landmarker_full.task"}      # the only files served, by exact name
+MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
+
+
+@app.get("/models/{name}")
+def browser_model(name: str):
+    """The MediaPipe pose model for the browser's on-device inference, served from this machine so a phone loads it once from
+    here (and the browser caches it for a week) instead of depending on a third-party CDN. Only the two files above."""
+    if name not in BROWSER_MODELS:
+        raise HTTPException(404, "no such model")
+    path = MODELS_DIR / name
+    if not path.is_file():
+        raise HTTPException(404, "model not downloaded: run backend/scripts/download_models.py")
+    return FileResponse(path, media_type="application/octet-stream", headers={"Cache-Control": "public, max-age=604800"})
 
 
 # Last, so every API and WebSocket route above wins: the built frontend, for a single-port deployment on :8000.

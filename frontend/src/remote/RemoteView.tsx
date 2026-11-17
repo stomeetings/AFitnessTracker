@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, Loader2, Play, SwitchCamera, Square } from "lucide-react";
 import { Hud } from "./Hud";
 import { drawPose, engineLabel, nextEngine, type AlertLevel, type Pose } from "./logic";
@@ -20,7 +20,31 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
   const [pin, setPin] = useState("");
   const t = s.telemetry;
   const running = s.stream !== null;
-  const otherEngine = s.engine ? nextEngine(s.engine, s.engines) : null;     // what a tap on the model badge switches to
+  const otherModel = s.model ? nextEngine(s.model, s.models) : null;         // what a tap on the model badge switches to
+  const sizeRef = useRef(size);
+  sizeRef.current = size;
+  const levelRef = useRef(level);
+  levelRef.current = level;
+  const dims = useRef({ w: 0, h: 0 });
+  const lastLocal = useRef<{ pose: Pose | null; frame: { w: number; h: number } } | null>(null);
+
+  /** Draws a pose onto the canvas. Used for 30 poses a second from the on-device model, so it only resizes the canvas when its
+   *  size really changed (resizing clears and reallocates it). */
+  const paint = useCallback((pose: Pose | null, frame: { w: number; h: number }) => {
+    const c = canvas.current, ctx = c?.getContext("2d");
+    const sz = sizeRef.current;
+    if (!c || !ctx || !sz.w) return;
+    const dpr = window.devicePixelRatio || 1;
+    const pw = Math.round(sz.w * dpr), ph = Math.round(sz.h * dpr);
+    if (dims.current.w !== pw || dims.current.h !== ph) { c.width = pw; c.height = ph; dims.current = { w: pw, h: ph }; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawPose(ctx, pose, frame, sz, levelRef.current);
+  }, []);
+
+  useEffect(() => {                                      // on-device pose: the model's output is drawn directly, never via state
+    s.setPoseListener(s.inference === "device" ? (pose, frame) => { lastLocal.current = { pose, frame }; paint(pose, frame); } : null);
+    return () => s.setPoseListener(null);
+  }, [s.inference, s.setPoseListener, paint]);   // eslint-disable-line react-hooks/exhaustive-deps -- `s` itself changes every render
 
   useEffect(() => {
     const v = s.videoRef.current;
@@ -40,13 +64,13 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
   }, []);
 
   useEffect(() => {                                      // redraw on a new pose, a resize, or a change of alert colour
-    const c = canvas.current, ctx = c?.getContext("2d");
-    if (!c || !ctx || !size.w) return;
-    const dpr = window.devicePixelRatio || 1;
-    c.width = Math.round(size.w * dpr); c.height = Math.round(size.h * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    drawPose(ctx, s.pose as Pose | null, s.frame ?? { w: 0, h: 0 }, size, level);
-  }, [s.pose, s.frame, size, level]);
+    if (s.inference === "device") {                      // the model drives its own drawing; this repaints the last pose after a resize
+      const last = lastLocal.current;
+      paint(last ? last.pose : null, last ? last.frame : { w: 0, h: 0 });
+      return;
+    }
+    paint(s.pose as Pose | null, s.frame ?? { w: 0, h: 0 });   // the server's pose, from its latest answer
+  }, [s.pose, s.frame, size, level, s.inference, paint]);
 
   const ratio = s.frame ? `${s.frame.w} / ${s.frame.h}` : "4 / 3";
   return (
@@ -65,7 +89,10 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
         counting={s.status === "live" ? t?.counting : undefined}
         reps={s.status === "live" ? t?.reps : undefined}
         fall={t?.fall?.status ?? "NORMAL"}
-        model={running && s.engine ? { name: s.engine, ms: s.stats.inferMs, other: otherEngine, wanted: s.engineWanted, onSwitch: () => { if (otherEngine) s.setEngine(otherEngine); } } : null}
+        model={running && s.model ? {
+          name: s.model, ms: s.modelMs, fps: s.inference === "device" ? s.local.fps : undefined, other: otherModel, wanted: s.modelWanted,
+          onSwitch: () => { if (otherModel) s.setModel(otherModel); },
+        } : null}
         onFlip={running ? () => void s.switchCamera() : undefined}
         flipLabel={s.facing === "user" ? "Use rear" : "Use front"}
         full={full} onToggleFull={onToggleFull} onStart={onStart} onPause={onPause}
@@ -84,7 +111,11 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
             className="flex items-center gap-2 rounded-2xl bg-emerald-500 px-8 py-4 text-xl font-bold text-slate-950 hover:bg-emerald-400 disabled:opacity-60">
             {s.status === "starting" ? <Loader2 className="animate-spin" /> : <Play />} Start camera
           </button>
-          <p className="max-w-sm text-sm text-slate-400">Uses this device&apos;s camera. Frames go to the server for analysis; the video is not stored.</p>
+          <p className="max-w-sm text-sm text-slate-400">
+            {s.inference === "device"
+              ? "Uses this device's camera. The pose is worked out on this device; only joint positions go to the server, never video."
+              : "Uses this device's camera. Frames go to the server for analysis; the video is not stored."}
+          </p>
         </div>
       )}
       {s.error && (
@@ -113,7 +144,9 @@ export function RemotePanel({ s }: { s: Session }) {
       </div>
       <div className="mt-2 text-xs text-slate-500">
         {s.status === "live"
-          ? `${s.stats.fps} fps · round trip ${s.stats.rtt} ms · frames ${s.stats.longSide}px${s.engine ? ` · ${engineLabel(s.engine)} ${s.stats.inferMs} ms` : ""}`
+          ? s.inference === "device"
+            ? `On-device ${s.local.fps} fps · ${s.local.ms} ms${s.local.delegate ? ` (${s.local.delegate})` : ""}${s.local.status === "loading" ? " · loading the model…" : ""} · only joint positions are sent`
+            : `${s.stats.fps} fps · round trip ${s.stats.rtt} ms · frames ${s.stats.longSide}px${s.engine ? ` · ${engineLabel(s.engine)} ${s.stats.inferMs} ms` : ""}`
           : STATUS_TEXT[s.status]}
       </div>
       {running && (

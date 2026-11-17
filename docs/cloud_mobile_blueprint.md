@@ -304,6 +304,13 @@ keypoints message instead of frames; the server path stays as the fallback for w
 landmarks to the existing joint names (the mapping exists in `mediapipe_engine.py`). Cap at 15 fps; measure heat
 and battery over a 20-minute session.
 
+*Status (2026-11-17): first slice implemented, awaiting a phone test (see the activity log): MediaPipe Lite runs in the browser
+(`frontend/src/remote/onDevicePose.ts`), the phone sends `kp` messages instead of frames, and the SERVER keeps rep counting, fall
+detection and escalation (`InferenceService.submit_pose`), so there is one implementation of the safety logic. On-device is the
+default on phones; the server models stay selectable. NOT done: the Full model on the phone, a battery/heat measurement over 20
+minutes, an offline copy of the WebAssembly files (they come from jsDelivr), and running analytics on the phone for fully
+offline use.*
+
 ### Verification per phase
 
 - Phases 1–3: existing 57 tests stay green; new tests for session isolation (two sessions do not share reps or

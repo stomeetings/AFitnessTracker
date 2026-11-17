@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Telemetry } from "../useTelemetry";
-import { MAX_QUALITY, canSendFrame, captureSize, extractToken, nextQuality, packFrame, reconnectDelay, type Pose, type Quality } from "./logic";
+import {
+  MAX_QUALITY, ON_DEVICE, bboxFromKeypoints, canSendFrame, captureSize, defaultInference, extractToken, isMobileDevice, keypointMessage,
+  nextQuality, packFrame, reconnectDelay, type InferenceMode, type Pose, type Quality,
+} from "./logic";
+import { createLandmarker, runLocalLoop, type LoadedLandmarker } from "./onDevicePose";
 import { MIC_CONSTRAINTS, micErrorText } from "./voice";
 import { useVoiceInput, type VoiceReply } from "./useVoiceInput";
 
@@ -19,6 +23,18 @@ function loadToken(): string {
     return localStorage.getItem(TOKEN_KEY) ?? "";
   } catch { return ""; }
 }
+
+const INFERENCE_KEY = "inference";
+/** Who computes the pose: this device (phones by default: no video leaves it) or the server (frames are sent). A choice made on
+ *  the badge is remembered; the automatic fallback to the server when on-device pose cannot start is not. */
+function loadInference(): InferenceMode {
+  try {
+    const saved = localStorage.getItem(INFERENCE_KEY);
+    if (saved === "device" || saved === "server") return saved;
+  } catch { /* no storage */ }
+  return defaultInference(isMobileDevice(navigator.userAgent, navigator.maxTouchPoints ?? 0));
+}
+const saveInference = (m: InferenceMode) => { try { localStorage.setItem(INFERENCE_KEY, m); } catch { /* storage blocked */ } };
 
 /** Browser camera -> /ws/session -> telemetry + keypoints back (backend/app/remote.py has the protocol).
  *  One frame is in flight at a time, so a slow link lowers the frame rate instead of building a queue.
@@ -71,6 +87,16 @@ export function useRemoteSession() {
   const [stats, setStats] = useState({ fps: 0, rtt: 0, longSide: MAX_QUALITY.longSide, inferMs: 0 });
   const [engines, setEngines] = useState<string[]>([]);              // pose models the server offers to switch between
   const [engineWanted, setEngineWanted] = useState<string | null>(null);   // asked for, not yet confirmed by the server
+  // On-device pose: the model runs in this browser and only joint positions are sent (no frames).
+  const [inference, setInferenceState] = useState<InferenceMode>(loadInference);
+  const inferenceRef = useRef(inference);
+  const [local, setLocal] = useState({ fps: 0, ms: 0, status: "idle" as "idle" | "loading" | "running", delegate: "" });
+  const landmarkerRef = useRef<LoadedLandmarker | null>(null);       // loaded once, kept across stops and restarts
+  const loopRef = useRef<{ stop: () => void } | null>(null);
+  const kpSeq = useRef(0);
+  const poseListener = useRef<((pose: Pose | null, frame: { w: number; h: number }) => void) | null>(null);
+  /** The view registers a function that draws a pose straight onto its canvas: 30 a second must not go through React state. */
+  const setPoseListener = useCallback((fn: ((pose: Pose | null, frame: { w: number; h: number }) => void) | null) => { poseListener.current = fn; }, []);
 
   const want = useRef(false);                       // the user asked for a running session
   const ws = useRef<WebSocket | null>(null);
@@ -131,6 +157,54 @@ export function useRemoteSession() {
     tick();
   }, []);
 
+  const stopLocal = () => { loopRef.current?.stop(); loopRef.current = null; };
+
+  /** On-device inference: load the model (once), then detect on every new camera frame and send the joints. If it cannot run
+   *  (no WebAssembly, offline and not cached, model missing, the model throws), the server takes over with frames. */
+  const startLocal = useCallback(async () => {
+    stopLocal();
+    const fallBack = (why: unknown) => {
+      if (!want.current) return;
+      setError(`On-device pose is not available (${why instanceof Error ? why.message : String(why)}); the server is doing it instead.`);
+      inferenceRef.current = "server"; setInferenceState("server");     // not saved: the next visit tries on-device again
+      setLocal((l) => ({ ...l, status: "idle" }));
+      startPump();
+    };
+    setLocal((l) => ({ ...l, status: "loading" }));
+    try {
+      if (!landmarkerRef.current) landmarkerRef.current = await createLandmarker();
+    } catch (e) {
+      fallBack(e);
+      return;
+    }
+    if (!want.current || inferenceRef.current !== "device" || !opened.current) {     // things changed while the model loaded
+      setLocal((l) => ({ ...l, status: "idle" }));
+      return;
+    }
+    const { landmarker, delegate } = landmarkerRef.current;
+    setLocal((l) => ({ ...l, status: "running", delegate }));
+    loopRef.current = runLocalLoop(() => videoRef.current, landmarker, {
+      pose: (kp, w, h, tMs) => {
+        const box = kp ? bboxFromKeypoints(kp) : null;
+        poseListener.current?.(kp && box ? { kp, bbox: box } : null, { w, h });      // the skeleton, with no network in between
+        const sock = ws.current;
+        if (sock && sock.readyState === WebSocket.OPEN && opened.current && sock.bufferedAmount < 65536) {   // never build a backlog
+          sock.send(keypointMessage(++kpSeq.current, tMs, w, h, kp ?? {}));
+        }
+      },
+      stats: (fps, ms) => setLocal((l) => ({ ...l, fps, ms })),
+      failed: fallBack,
+    });
+  }, [startPump]);
+
+  /** (Re)start whichever source of poses is selected: this device's model, or JPEG frames for the server's. */
+  const startActive = useCallback(() => {
+    stopPump();
+    stopLocal();
+    if (inferenceRef.current === "device") void startLocal();
+    else startPump();
+  }, [startLocal, startPump]);
+
   const releaseWake = () => { void wake.current?.release().catch(() => {}); wake.current = null; };
   const holdWake = useCallback(async () => {       // keep the screen on during a session; best effort, not on every browser
     try { if (want.current && !wake.current) wake.current = (await navigator.wakeLock?.request("screen")) ?? null; } catch { /* denied */ }
@@ -154,7 +228,7 @@ export function useRemoteSession() {
         setError(null); setStatus("live");
         setEngines(m.engines ?? []);
         if (exerciseRef.current) sock.send(JSON.stringify({ type: "cmd", name: "exercise", value: exerciseRef.current }));
-        startPump();
+        startActive();
       } else if (m.type === "t") {
         const now = performance.now();
         if (m.ack === p.seq || m.error) p.inflight = false;       // an error reply also frees the pump
@@ -179,6 +253,7 @@ export function useRemoteSession() {
     };
     sock.onclose = (ev) => {
       stopPump();
+      stopLocal();                                                 // restarted by the next hello
       if (ws.current === sock) ws.current = null;
       if (!want.current) return;
       if (ev.code === 4401) {                                      // token missing or wrong: retrying cannot help
@@ -197,7 +272,7 @@ export function useRemoteSession() {
     };
     sock.onerror = () => sock.close();
     setStatus((s) => (s === "live" ? s : "connecting"));
-  }, [startPump]);
+  }, [startActive]);
 
   const attach = (s: MediaStream) => {
     streamRef.current = s;
@@ -222,6 +297,8 @@ export function useRemoteSession() {
     setStream(null); setMsg(null); setStatus("idle");
     setStats({ fps: 0, rtt: 0, longSide: MAX_QUALITY.longSide, inferMs: 0 });
     setEngines([]); setEngineWanted(null);
+    stopLocal();
+    setLocal((l) => ({ ...l, fps: 0, ms: 0, status: "idle" }));
   }, []);
 
   /** `pin` is a token typed on the connect screen. */
@@ -309,19 +386,46 @@ export function useRemoteSession() {
   const engine = msg?.engine ?? null;
   useEffect(() => { if (engine !== null && engine === engineWanted) setEngineWanted(null); }, [engine, engineWanted]);
 
+  /** Choose who computes the pose: this device or the server. Switching while a session runs restarts the right source at once. */
+  const setInference = useCallback((mode: InferenceMode) => {
+    inferenceRef.current = mode;
+    setInferenceState(mode);
+    saveInference(mode);
+    if (want.current && opened.current) startActive();
+  }, [startActive]);
+
+  /** The model badge: "device" = this phone's own MediaPipe; anything else is one of the server's models. */
+  const setModel = useCallback((name: string) => {
+    if (name === ON_DEVICE) { setInference("device"); return; }
+    setInference("server");
+    if (name !== engine) setEngine(name);
+  }, [setInference, setEngine, engine]);
+
   useEffect(() => {
     const onVisible = () => { if (document.visibilityState === "visible") void holdWake(); };   // the lock is dropped when hidden
     document.addEventListener("visibilitychange", onVisible);
-    return () => { document.removeEventListener("visibilitychange", onVisible); stop(); };
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      stop();
+      landmarkerRef.current?.landmarker.close();                     // the model is released with the page, not with each stop
+      landmarkerRef.current = null;
+    };
   }, [holdWake, stop]);
 
+  const models = useMemo(() => [ON_DEVICE, ...engines], [engines]);      // what the badge cycles through
+  const model = inference === "device" ? ON_DEVICE : engine;
+  const modelMs = inference === "device" ? local.ms : stats.inferMs;     // the model's own time per pose
+  const modelWanted = inference === "device" && local.status === "loading" ? ON_DEVICE : engineWanted;
+  const fps = inference === "device" ? local.fps : stats.fps;
+
   const telemetry: Telemetry | null = msg
-    ? ({ ...msg, fps: stats.fps, error: msg.error ?? null, privacy: undefined } as unknown as Telemetry)
+    ? ({ ...msg, fps, error: msg.error ?? null, privacy: undefined } as unknown as Telemetry)
     : null;
 
   return {
     videoRef, status, error, stream, facing, stats, telemetry, needsToken,
     engine, engines, engineWanted, setEngine,
+    inference, local, models, model, modelMs, modelWanted, setModel, setPoseListener,
     voice,
     pose: msg?.pose ?? null, frame: msg?.frame ?? null,
     start, stop, switchCamera, send,
