@@ -1,0 +1,12 @@
+{
+  "appId": "com.aifitness.tracker",
+  "appName": "AI Fitness Tracker",
+  "webDir": "dist",
+  "server": {
+    "url": "https://yea-yards-boys-lists.trycloudflare.com",
+    "cleartext": false
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}

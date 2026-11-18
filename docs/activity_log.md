@@ -973,6 +973,16 @@ only with sign-off; Capacitor native only when background fall monitoring is req
   calibration samples by time (1.5 s window), keypoint replies are rate-limited to 10/s and only the newest waiting frame per session is
   processed. So the fast phone is to be bisected with the three switches rather than guessed at.
 
+### Native demo APK plan (2026-11-17) — written, NOT yet run
+
+- `NATIVE_DEMO_PLAN.md`: Android build without Android Studio (JDK 21, command-line tools, sdkmanager, env vars), Capacitor
+  WebView shell loading the tunnel URL (`server.url`), camera/mic permissions, Galaxy A52 setup (USB debugging, Auto Blocker off),
+  demo-day runbook with scrcpy, troubleshooting table.
+- `scripts/build_and_serve_apk.py`: writes `frontend/capacitor.config.json`, `cap add/sync android`, patches the manifest
+  permissions, `gradlew assembleDebug`, serves only the APK on `0.0.0.0:8080` with a terminal QR code (`qrcode` package), or
+  `--adb` installs over USB. Refuses URLs containing a token; warns on http (no camera outside a secure context).
+- No pose-tracking or backend code changed. JDK 21 instead of the requested 17: current Capacitor needs it.
+
 ### Next: P2 persistence and upload mode
 
 SQLite + JSON report, recording mode A/B, H.264 recorder via imageio-ffmpeg, upload job worker process, session history with Recharts.
