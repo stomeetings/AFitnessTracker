@@ -8,7 +8,7 @@ import {
 } from "./logic";
 
 const NO_JOINTS: Keypoints = Object.freeze({}) as Keypoints;     // "nobody in view": one shared empty set, never written to
-import { createLandmarker, runLocalLoop, type LoadedLandmarker } from "./onDevicePose";
+import { getLandmarker, runLocalLoop, type LoadedLandmarker } from "./onDevicePose";
 import { MIC_CONSTRAINTS, micErrorText } from "./voice";
 import { useVoiceInput, type VoiceReply } from "./useVoiceInput";
 
@@ -224,7 +224,7 @@ export function useRemoteSession() {
     };
     setLocal((l) => ({ ...l, status: "loading" }));
     try {
-      if (!landmarkerRef.current) landmarkerRef.current = await createLandmarker();
+      if (!landmarkerRef.current) landmarkerRef.current = await getLandmarker();      // already loaded and warmed up by preloadLandmarker()
     } catch (e) {
       fallBack(e);
       return;
@@ -511,8 +511,7 @@ export function useRemoteSession() {
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
       stop();
-      landmarkerRef.current?.landmarker.close();                     // the model is released with the page, not with each stop
-      landmarkerRef.current = null;
+      landmarkerRef.current = null;       // the shared model (onDevicePose.getLandmarker) lives with the page: a StrictMode re-mount reuses it
     };
   }, [holdWake, stop]);
 

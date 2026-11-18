@@ -1016,6 +1016,18 @@ only with sign-off; Capacitor native only when background fall monitoring is req
 - `App.tsx`: the Start button and the voice command "start_session" show a non-blocking overlay (`pointer-events-none`, no blur) and speak each step; the Exercise Guide ("preview") opening/closing says "Displaying preview" / "Closing preview" (skipped while a countdown is speaking).
 - Nothing touches the frame loop, the pose code or the server. Reps still start counting immediately on Start (the overlay is a cue only). Phone check pending; tsc/vitest/build not yet run.
 
+### Tunnel over HTTP/2 and skeleton flicker (2026-11-18)
+
+- Tunnel: no script launches cloudflared, so the command is changed where it is documented (`NATIVE_DEMO_PLAN.md`, `docs/cloud_mobile_blueprint.md`): `cloudflared tunnel --url http://localhost:8000 --protocol http2` (TCP instead of the default QUIC/UDP). The tunnel must be restarted by hand with it; the URL changes, so the APK needs a rebuild.
+- Canvas (`RemoteView.tsx`): the existing code already sized the backing store with `devicePixelRatio` and cleared every frame; kept, and the clear now covers the whole backing store in device pixels (identity transform) before the CSS-pixel transform. Canvas class gained `pointer-events-none block`. Likely real cause of the "glitter": a one-frame dropout (`pose === null`) blanked the skeleton for a frame; a null pose within 150 ms of the last drawn one is now ignored (the canvas keeps the last drawing), after which it clears as before. Display only; counting and fall logic are server-side and unaffected. Zero allocation per frame (a ref and `performance.now()`).
+- tsc/vitest/build and the phone to be checked by the user.
+
+### Model preloading and the phantom "Closing preview" (2026-11-18)
+
+- Phantom cue cause: the preview cue was an effect on `guideOpen` that skipped the first run with a ref. `main.tsx` uses React StrictMode, which runs mount effects twice in development, so the second run spoke "Closing preview" at launch (it also spoke when a session start/end closed the guide). Fix in `App.tsx`: the effect is gone; `showGuide(open)` (Info button, the guide's close button, voice "show/hide preview") is the only caller of the cue, and says nothing when the state would not change. Start/resume/stop that close the guide do it silently.
+- Model manager (`onDevicePose.ts`): `getLandmarker()` is a page-wide singleton promise (WASM + model + GPU delegate), followed by `warmUp()`: one detection on a blank 256x256 canvas (timestamp 1 ms) so shader compilation is paid in the background; a failed load is not cached (retries on Start). `preloadLandmarker()` is called from an `App.tsx` effect when the device camera mode is active (not in Server camera mode, which never needs it). `useRemoteSession` now awaits `getLandmarker()` (instant when ready) and no longer closes the model on unmount (StrictMode would otherwise re-use a closed instance). The YOLO weights are server-side and unaffected.
+- Not in the frame loop. tsc/vitest/build to be run by the user; phone timing of Start not yet measured.
+
 ### Desktop speech: no cancel() directly before speak() (2026-11-18)
 
 - `cues.ts` browser path: an urgent phrase calls `cancel()` and speaks 30 ms later (Windows/Chrome drops a `speak()` issued in the same tick as `cancel()`); a non-urgent phrase that arrives inside that window is deferred by 30 ms too so the order holds. `resume()` still runs before every speak; utterance `Set` + `onend`/`onerror` cleanup and the throttled touch/click/keydown unlock are unchanged (the function is `unlockSpeech`). Native path: errors (sync or promise) are caught and `console.warn`ed, never thrown into the UI.

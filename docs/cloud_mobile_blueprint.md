@@ -283,13 +283,13 @@ One-time: `winget install --id Cloudflare.cloudflared` (or install ngrok), and `
    `backend/.venv/Scripts/python -c "import secrets; print(secrets.token_urlsafe(16))"`). Read on every request, no restart needed.
 2. Terminal 1, backend: `cd backend; .venv\Scripts\uvicorn app.main:app --port 8000`
 3. Terminal 2, frontend: `cd frontend; npm run dev`
-4. Terminal 3, tunnel: `cloudflared tunnel --url http://localhost:5173` and copy the printed `https://<words>.trycloudflare.com`.
+4. Terminal 3, tunnel: `cloudflared tunnel --url http://localhost:5173 --protocol http2` (http2 instead of the default QUIC: UDP drops on some networks make the tunnel reconnect) and copy the printed `https://<words>.trycloudflare.com`.
    (ngrok instead: `ngrok http 5173`; its free plan shows a one-time "Visit site" page first.)
 5. Phone browser: open `https://<words>.trycloudflare.com/?token=<your token>`. The page opens in "This device" mode on its own;
    tap Start camera, allow the camera. Skeleton, reps and the fall dialog work; "Use rear" switches cameras.
 6. Install as an app (needs the production build, because the service worker is not registered in dev): stop terminal 2 and run
    `cd frontend; npm run build`, restart the backend (it then serves the app itself on :8000), and tunnel that instead:
-   `cloudflared tunnel --url http://localhost:8000`. Open the new address on the phone, then Android Chrome: menu, "Install app";
+   `cloudflared tunnel --url http://localhost:8000 --protocol http2`. Open the new address on the phone, then Android Chrome: menu, "Install app";
    iPhone Safari: Share, "Add to Home Screen" (iOS wants a PNG icon; the SVG one shows a generic tile).
 7. When finished close the tunnel (Ctrl+C in terminal 3): the address stops working at once. Quick tunnels get a new name each run.
 

@@ -11,6 +11,7 @@ import { useFullscreen } from "./remote/useFullscreen";
 import { VOICE_HELP, VoiceChip } from "./remote/VoiceChip";
 import { intentEffects } from "./remote/voice";
 import { cue, runCountdown, unlockSpeech } from "./cues";
+import { preloadLandmarker } from "./remote/onDevicePose";
 import { useTelemetry, type Limb } from "./useTelemetry";
 
 const ENGINES = [
@@ -157,13 +158,20 @@ export default function App() {
     stopCount.current = runCountdown((s) => { setCount(s); if (s === null) stopCount.current = null; });
   };
   useEffect(() => { const off = unlockSpeech(); return () => { off(); stopCount.current?.(); }; }, []);
-  // Preview (the Exercise Guide) opened/closed by button or voice: a soft tone. A session start closes the guide too, but its
-  // own countdown tones must not be talked over, hence the check.
-  const firstGuide = useRef(true);
-  useEffect(() => {
-    if (firstGuide.current) { firstGuide.current = false; return; }
-    if (!stopCount.current) cue(guideOpen ? "previewOpen" : "previewClose");
-  }, [guideOpen]);
+  // Preview (the Exercise Guide) opened/closed by the user (button or voice): says so. This is a handler, NOT an effect on
+  // `guideOpen`: an effect also runs on mount (twice under React StrictMode) and when a session start or end closes the guide,
+  // which spoke "Closing preview" when the app opened. Only explicit user actions call it.
+  const guideNow = useRef(false);
+  guideNow.current = guideOpen;
+  const showGuide = (open: boolean) => {
+    if (open === guideNow.current) return;                // nothing changes: nothing is said
+    guideNow.current = open;
+    setGuideOpen(open);
+    cue(open ? "previewOpen" : "previewClose");
+  };
+  // Start the on-device pose model loading as soon as this device is the camera: the Start button then finds it ready.
+  // (Not in Server camera mode: that visitor never needs the ~10 MB of WASM and model.)
+  useEffect(() => { if (device) preloadLandmarker(); }, [device]);
   const startSession = () => { setPaused(false); countdown(); setGuideOpen(false); if (device) remote.send("start_session"); else void post("/api/session/start"); };
   const pauseSession = () => { if (device) remote.send("stop_session"); else void post("/api/session/stop"); };
   const fs = useFullscreen();               // the video wrapper goes full screen with its HUD; modal dialogs still sit on top
@@ -204,7 +212,9 @@ export default function App() {
       const fx = intentEffects(heardIntent, device);
       if (heardIntent === "start_session") countdown();
       console.info("[voice] applying", heardIntent, fx);
-      if (fx.showGuide !== undefined) setGuideOpen(fx.showGuide);      // the Exercise Guide: the same state the Info button sets
+      // the Exercise Guide: the same state the Info button sets. Only "show/hide preview" announce it; a start, resume or stop
+      // that closes the guide does so silently (the countdown or "Paused" is speaking).
+      if (fx.showGuide !== undefined) (heardIntent === "show_preview" || heardIntent === "hide_preview" ? showGuide : setGuideOpen)(fx.showGuide);
       if (fx.stopDeviceSession) remote.stop();
     }, 700);
   }, [heardSeq]);   // eslint-disable-line react-hooks/exhaustive-deps -- one run per spoken sentence
@@ -355,7 +365,7 @@ export default function App() {
                 className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm">
                 {exercises.map((x) => <option key={x}>{x}</option>)}
               </select>
-              <button onClick={() => setGuideOpen(true)} disabled={!guide} title="Exercise Guide" aria-label="Exercise Guide"
+              <button onClick={() => showGuide(true)} disabled={!guide} title="Exercise Guide" aria-label="Exercise Guide"
                 className="flex items-center rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm hover:bg-slate-700 disabled:opacity-50">
                 <Info size={14} />
               </button>
@@ -392,7 +402,7 @@ export default function App() {
           )}
         </aside>
       </main>
-      {guideOpen && guide && t && <ExerciseGuide info={guideInfo} initial={t.exercise} onClose={() => setGuideOpen(false)} />}
+      {guideOpen && guide && t && <ExerciseGuide info={guideInfo} initial={t.exercise} onClose={() => showGuide(false)} />}
       {alert && (alert.state === "COUNTDOWN" || alert.state === "ALERTED") && <FallCheck alert={alert} voice={device ? remote.voice.voiceState : t?.fall?.voice} onAck={act.ack} onEscalate={act.escalate} canListen={!device} />}
     </div>
   );

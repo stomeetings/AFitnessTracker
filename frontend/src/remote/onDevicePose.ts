@@ -42,6 +42,34 @@ export async function createLandmarker(): Promise<LoadedLandmarker> {
   throw new Error(`could not load the pose model (${last instanceof Error ? last.message : String(last)})`);
 }
 
+// ---- ModelManager: one shared landmarker, loaded in the background --------------------------------------------------------
+let shared: Promise<LoadedLandmarker> | null = null;
+
+/** One dummy inference on a blank frame, so the GPU shader/graph compilation (the slow first detection) happens now, in the
+ *  background, and not when the user presses Start. Failure is harmless: the first real frame just pays the cost. The timestamp
+ *  1 ms stays below every later frame's (performance.now()), as VIDEO mode requires increasing times. */
+function warmUp(loaded: LoadedLandmarker): LoadedLandmarker {
+  try {
+    const c = document.createElement("canvas");
+    c.width = c.height = 256;
+    loaded.landmarker.detectForVideo(c, 1);
+  } catch { /* ignore */ }
+  return loaded;
+}
+
+/** The landmarker, created at most once per page: the WASM, the model and the shader compile run on the first call (made by
+ *  `preloadLandmarker` when the app opens), every later call gets the same instance at once. A failed load is not cached, so the
+ *  next call retries. The instance lives as long as the page (React StrictMode re-mounts must not close it). */
+export function getLandmarker(): Promise<LoadedLandmarker> {
+  if (!shared) shared = createLandmarker().then(warmUp).catch((e) => { shared = null; throw e; });
+  return shared;
+}
+
+/** Fire and forget: start loading now; errors surface later, when Start asks for the model and it is retried. */
+export function preloadLandmarker(): void {
+  void getLandmarker().catch(() => {});
+}
+
 export type LoopHooks = {
   /** One result per processed video frame: the joints in pixels of the w x h frame (null = nobody found), its time, and the
    *  metric 3D world joints when the model gave them (the server then measures angles independent of the view).

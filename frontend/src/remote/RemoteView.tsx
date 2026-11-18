@@ -29,6 +29,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
   // The last pose drawn (a reference to the loop's reused buffers, not a copy): repainted after a resize. One object, mutated.
   const lastLocal = useRef<{ pose: Pose | null; frame: { w: number; h: number } }>({ pose: null, frame: { w: 0, h: 0 } });
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);          // fetched once, not per frame
+  const lastSeen = useRef(0);                                            // when a pose was last drawn (performance.now())
 
   /** Draws a pose onto the canvas. Used for 30 poses a second from the on-device model, so it only resizes the canvas when its
    *  size really changed (resizing clears and reallocates it) and allocates nothing itself. */
@@ -37,10 +38,17 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
     const ctx = ctxRef.current ?? (c ? (ctxRef.current = c.getContext("2d")) : null);
     const sz = sizeRef.current;
     if (!c || !ctx || !sz.w) return;
+    // A short dropout (the model loses the person for a frame or two) must not blank the skeleton: that is the flicker. Keep the
+    // last drawing (the canvas holds it) for 150 ms; after that, or when nobody is there for longer, it is cleared as before.
+    const now = performance.now();
+    if (pose) lastSeen.current = now;
+    else if (now - lastSeen.current < 150) return;
     const dpr = window.devicePixelRatio || 1;
     const pw = Math.round(sz.w * dpr), ph = Math.round(sz.h * dpr);
     if (dims.current.w !== pw || dims.current.h !== ph) { c.width = pw; c.height = ph; dims.current = { w: pw, h: ph }; }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, pw, ph);                            // the whole backing store, in device pixels: nothing of the last frame can stay
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);                 // then CSS-pixel coordinates for drawPose
     drawPose(ctx, pose, frame, sz, levelRef.current);
   }, []);
 
@@ -78,7 +86,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
       <div className="absolute inset-0" style={{ transform: s.facing === "user" ? "scaleX(-1)" : undefined }}>
         {/* opacity, not visibility: a hidden video can be paused by the browser and stay black when shown again */}
         <video ref={s.videoRef} playsInline muted autoPlay className={`h-full w-full object-contain ${hidden ? "opacity-0" : ""}`} />
-        <canvas ref={canvas} className="absolute inset-0 h-full w-full" />
+        <canvas ref={canvas} className="pointer-events-none absolute inset-0 block h-full w-full" />
       </div>
 
       {/* The HUD: status, READY / ACTIVE, big rep counter, model badge, camera flip, full screen, Start / Pause, voice chip */}

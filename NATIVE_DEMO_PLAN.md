@@ -193,8 +193,11 @@ The backend serves the built app on :8000 itself, so no Vite dev server is neede
 **Terminal 2, tunnel:**
 
 ```bash
-cloudflared tunnel --url http://localhost:8000
+cloudflared tunnel --url http://localhost:8000 --protocol http2
 ```
+
+`--protocol http2` forces HTTP/2 over TCP. The default (QUIC, over UDP) is dropped by some Wi-Fi/router setups, which shows up as
+the tunnel reconnecting and the app's "Connection lost" banner.
 
 Copy the `https://<words>.trycloudflare.com` it prints and open it once in the laptop browser to check it works.
 
