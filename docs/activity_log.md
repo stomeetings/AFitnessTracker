@@ -983,6 +983,87 @@ only with sign-off; Capacitor native only when background fall monitoring is req
   `--adb` installs over USB. Refuses URLs containing a token; warns on http (no camera outside a secure context).
 - No pose-tracking or backend code changed. JDK 21 instead of the requested 17: current Capacitor needs it.
 
+### Native demo APK: Section 2 done, rehearsal build in progress (2026-11-17/18)
+
+- **Section 1** (JDK 21 Temurin 21.0.13, command-line tools, platform-tools, android-35, build-tools, Gradle Windows-ROOT
+  config) done by the user.
+- **Section 2 done:** `npm install @capacitor/core @capacitor/android` and `-D @capacitor/cli` in `frontend/` (npm audit reports 3
+  vulnerabilities, 1 moderate, 2 critical; already present before the CLI; deliberately NOT `npm audit fix --force` before the demo,
+  review after). `npm run build` ok. `qrcode` 8.2 installed in `backend/.venv`.
+- **Section 3 rehearsal** with `--url https://showtimes-shore-review-bunch.trycloudflare.com/` (bare URL, no token):
+  - `frontend/capacitor.config.json` written; `npx cap add android` created `frontend/android/`; the manifest got 4 permission
+    lines (CAMERA, RECORD_AUDIO, MODIFY_AUDIO_SETTINGS, camera feature; INTERNET was already there); `cap sync` ok.
+  - Fix 1: `JAVA_HOME is not set`: Claude Code's shell keeps the environment from its start. Workaround: export `JAVA_HOME` /
+    `ANDROID_HOME` in the command (with `cygpath -w`), or restart Claude Code from a new terminal.
+  - Fix 2: `'gradlew.bat' is not recognized`: Claude Code's shell does not search the current folder. The script now calls
+    gradlew by its full path.
+  - Fix 3: `PKIX path building failed` on the Gradle download: the wrapper reads only `GRADLE_OPTS`, not `gradle.properties`.
+    The script sets `GRADLE_OPTS=-Djavax.net.ssl.trustStoreType=Windows-ROOT` on Windows (full certificate checks, Windows store).
+    `NATIVE_DEMO_PLAN.md` step 1.5 updated.
+  - Fix 4: Gradle download `timeout (10000ms)`: the script patches `android/gradle/wrapper/gradle-wrapper.properties` to the
+    smaller `-bin` package and `networkTimeout=120000` (new `patch_wrapper()`).
+  - Result: Gradle 8.14.3 downloaded, daemon started; the run was then moved to the background by Claude Code's 120 s limit and
+    killed because Windows ran critically low on memory (not a build error).
+- **Next:** stop the backend and leftover daemon (`frontend/android/gradlew.bat --stop`), run the script in a separate Git Bash
+  window (not via `!`), expect `BUILD SUCCESSFUL` + QR code, then install on the Galaxy A52 and continue Section 4 (Auto Blocker
+  off, scrcpy). If memory runs out again: cap Gradle memory (`org.gradle.jvmargs`) based on the laptop's RAM.
+- Still open before any commit: remove the real `REMOTE_SESSIONS` / `REMOTE_ACCESS_TOKEN` lines from `backend/.env.example`,
+  rotate the token; keep `docs/sample/` and `backend/.env` out of git.
+
+### Audit fixes: telemetry re-render storm, dead-tunnel watchdog + banner, safety queue, HUD GPU effects (2026-11-18) — NOT yet run
+
+- **Re-render storm (`useRemoteSession.ts`).** Server replies (up to 10/s, every frame in server mode) no longer call `setMsg` /
+  `setStats`. They are stored in refs (`msgRef`, pump state) and reach React on a 250 ms UI tick (`UI_TICK_MS`), or at once when
+  `urgentChange` says so (first message, fall status or alert state, standby<->counting, exercise, model, error, a completed rep).
+  Stats only call `setStats` when a rounded value changed. In server-inference mode the skeleton is now drawn from the reply
+  straight through the pose listener (like on-device), not through `msg.pose` state; `RemoteView` registers the listener in both
+  modes and no longer repaints from state (`pose` removed from the hook's return).
+- **Dead-tunnel watchdog.** `lastRecv` / `lastSent` refs; the UI tick calls `connectionLost` (we sent something after the last
+  reply and nothing came back for 4 s, not while the tab is hidden; both reset on becoming visible and on hello) and then drops the
+  socket itself (a dead tunnel never closes it) and reconnects with the usual backoff. The socket-close path is now one function
+  (`closed`) that also ignores stale sockets, clears the telemetry (so a dead session's reps can no longer look live) and wipes the
+  skeleton. HUD: red pulsing "Connection lost — reconnecting… Reps and fall monitoring are paused" banner (`Hud` prop `lost`,
+  `RemoteView` passes it while reconnecting with the camera running).
+- **Safety queue.** `send()` for `ack_fall` / `escalate` while the socket is not ready is queued (max 8, newest kept, 120 s max
+  age), re-sent right after the next hello, cleared on stop; the user is told "No connection. Your answer will be sent as soon as
+  it is back." Other commands are still dropped while offline (they belong to the old session: reset, start/stop).
+- **GPU effects.** All `backdrop-blur` removed from the HUD (opaque-ish `bg-slate-900/90` instead), rep-counter text shadow reduced
+  from an 8 px blur to 2 px. There were no width/left animations in the HUD itself; the two in the side panel were fixed too:
+  `App.tsx` angle bar now `scaleX` + `transition-transform`, privacy toggle knob `translate-x` instead of `left` + `transition-all`.
+  Not changed: the guide's progress bar (`ExerciseGuide.tsx:238`).
+- Tests: +vitest for `connectionLost`, `urgentChange`, `SAFETY_COMMANDS`. To verify: `npx tsc --noEmit`, `npm test`, `npm run build`;
+  then on the phone: kill the tunnel (Ctrl+C in the cloudflared terminal) and expect the banner within about 4-5 s, reps hidden,
+  and recovery by itself when the tunnel (same URL) is back.
+
+### Skill added: api-tunnel-architecture + read-only network audit (2026-11-18)
+
+- `.claude/skills/api-tunnel-architecture/SKILL.md`: lightweight-JSON-only on the live link (with the honest note that the phone
+  cannot send "final rep counts" while counting and fall detection run on the server: it sends keypoints, capped at 4096 bytes),
+  non-blocking bounded send paths, timeouts/backoff/heartbeat, offline-first caching, batching and idempotent uploads. No app code changed.
+- Audit gaps (priority order): no half-open connection detection (no heartbeat/watchdog/online events: HUD can say LIVE while the
+  tunnel is dead); offline means no counting and no fall monitoring with no clear message and stale reps shown; commands silently
+  dropped when the socket is not open (incl. ack/escalate); no fetch timeouts (`App.tsx` post, `/api/exercises`, `/api/voice`, etc.);
+  no startup retry/cache for exercise lists; no local persistence/batching of results; backoff without jitter; server-mode frame
+  path allocates per frame; voice audio base64 over the socket; Capacitor shell has no offline fallback page.
+
+### Skill added: react-capacitor-mobile + read-only UI audit (2026-11-18)
+
+- `.claude/skills/react-capacitor-mobile/SKILL.md`: no React state for per-frame tracking data (refs + canvas/DOM writes, memoised
+  leaves, 2-4 Hz for visible numbers), compositor-only animation (transform/opacity, no blur over live video), `dvh` + safe-area
+  insets + `touch-manipulation` + instant `active:` feedback + 44 px targets. No app code changed.
+- Audit findings (listed in the skill, priority order): server telemetry `setMsg`/`setStats` per reply re-renders the tree (and
+  `useTelemetry` `setT` per message on desktop); width/left transitions (`App.tsx:53,249`, `ExerciseGuide.tsx:238`);
+  `backdrop-blur` on the HUD over the video; `vh`/`screen` units (5 places); no safe-area padding anywhere; no
+  `touch-action: manipulation` or press feedback on the HUD buttons, HUD buttons 40 px.
+
+### Skill added: cv-fitness-pipeline (2026-11-18)
+
+- `.claude/skills/cv-fitness-pipeline/SKILL.md`: guardrails for per-frame computer-vision code: 15-24 fps clock-based throttling
+  with latest-frame-wins, no allocation in the hot loop (preallocated buffers, no React state per frame, borrowed MediaPipe
+  results), O(1) smoothing (time-based EMA or One-Euro, applied once), and release of streams, landmarker, canvases, listeners
+  on unmount/hidden. It names the files that already follow each rule and lists the known gaps (30 fps cap, per-frame allocations
+  in `landmarksToKeypoints`/`worldToJoints`, 1280x720 request, unmount cleanup to verify) without changing any code.
+
 ### Next: P2 persistence and upload mode
 
 SQLite + JSON report, recording mode A/B, H.264 recorder via imageio-ffmpeg, upload job worker process, session history with Recharts.

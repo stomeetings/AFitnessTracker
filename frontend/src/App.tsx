@@ -50,7 +50,7 @@ function LimbCard({ side, limb }: { side: string; limb: Limb }) {
         </div>
       </div>
       <div className="mt-2 h-1.5 w-full rounded bg-slate-800">
-        <div className="h-1.5 rounded bg-emerald-500 transition-[width]" style={{ width: `${Math.min(100, Math.max(0, angle / 1.8))}%` }} />
+        <div className="h-1.5 origin-left rounded bg-emerald-500 transition-transform" style={{ transform: `scaleX(${Math.min(100, Math.max(0, angle / 1.8)) / 100})` }} />
       </div>
       <div className="mt-2 flex gap-2 text-xs">
         <span className="rounded-full border border-slate-700 px-2 py-0.5">ROM {limb.last_rom.toFixed(0)}°</span>
@@ -246,7 +246,7 @@ export default function App() {
           className="ml-auto flex items-center gap-2 rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300 hover:bg-slate-800">
           Privacy
           <span className={`relative h-4 w-7 rounded-full transition-colors ${privacyPref ? "bg-emerald-500" : "bg-slate-700"}`}>
-            <span className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${privacyPref ? "left-3.5" : "left-0.5"}`} />
+            <span className={`absolute left-0.5 top-0.5 h-3 w-3 rounded-full bg-white transition-transform ${privacyPref ? "translate-x-3" : ""}`} />
           </span>
         </button>
         {!device && (

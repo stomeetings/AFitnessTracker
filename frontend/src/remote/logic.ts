@@ -33,6 +33,37 @@ export function canSendFrame(now: number, sentAt: number, inflight: boolean): bo
   return !inflight || since > ACK_TIMEOUT_MS;
 }
 
+// ---- Link health and UI pacing (the tunnel can die without the socket noticing; React must not render per reply) ----------------
+
+/** No server message for this long while we are sending = the link is dead (a quick tunnel can drop and leave the socket "open"). */
+export const LOST_AFTER_MS = 4000;
+/** The UI is brought up to date, and the link checked, this often: server replies arrive up to 10 times a second, React renders 4. */
+export const UI_TICK_MS = 250;
+/** Commands that protect the person: kept and re-sent after a reconnect instead of being lost with a dropped socket. */
+export const SAFETY_COMMANDS: ReadonlyArray<string> = ["ack_fall", "escalate"];
+export const SAFETY_QUEUE_MAX = 8;
+export const SAFETY_MAX_AGE_MS = 120_000;     // an answer older than this belongs to a situation that is long over
+
+/** Whether the link looks dead: we sent something after the last server message and nothing has come back for `afterMs`.
+ *  Nothing sent (hidden tab, model still loading) means nothing is owed, so no verdict. */
+export const connectionLost = (now: number, lastRecv: number, lastSent: number, afterMs = LOST_AFTER_MS): boolean =>
+  lastSent > lastRecv && now - lastRecv > afterMs;
+
+type Snapshot = {
+  exercise?: string; counting?: boolean; engine?: string; error?: string | null;
+  fall?: { status?: string; alert?: { state?: string } }; reps?: Record<string, { reps: number }>;
+};
+const repTotal = (s: Snapshot) => Object.values(s.reps ?? {}).reduce((n, l) => n + l.reps, 0);
+
+/** Telemetry that must reach the screen at once, not at the next UI tick: the first message, a fall or alert change, standby <->
+ *  counting, a new exercise or model, an error, a completed rep. Everything else (angles, states, timings) waits for the tick. */
+export function urgentChange(prev: Snapshot | null, next: Snapshot): boolean {
+  if (!prev) return true;
+  return prev.fall?.status !== next.fall?.status || prev.fall?.alert?.state !== next.fall?.alert?.state
+    || prev.counting !== next.counting || prev.exercise !== next.exercise || prev.engine !== next.engine
+    || (prev.error ?? null) !== (next.error ?? null) || repTotal(prev) !== repTotal(next);
+}
+
 /** `[u32 frame number][f64 capture time ms]` big-endian + JPEG: what `struct.Struct(">Id")` reads on the server. */
 export function packFrame(seq: number, captureMs: number, jpeg: ArrayBuffer): ArrayBuffer {
   const out = new Uint8Array(12 + jpeg.byteLength);

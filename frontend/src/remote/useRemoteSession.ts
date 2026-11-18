@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Telemetry } from "../useTelemetry";
 import {
-  MAX_QUALITY, ON_DEVICE, bboxFromKeypoints, canSendFrame, captureSize, defaultInference, extractToken, isMobileDevice, keypointMessage,
-  nextQuality, packFrame, reconnectDelay, type InferenceMode, type Pose, type Quality,
+  MAX_QUALITY, ON_DEVICE, SAFETY_COMMANDS, SAFETY_MAX_AGE_MS, SAFETY_QUEUE_MAX, UI_TICK_MS, bboxFromKeypoints, canSendFrame, captureSize,
+  connectionLost, defaultInference, extractToken, isMobileDevice, keypointMessage, nextQuality, packFrame, reconnectDelay, urgentChange,
+  type InferenceMode, type Pose, type Quality,
 } from "./logic";
 import { createLandmarker, runLocalLoop, type LoadedLandmarker } from "./onDevicePose";
 import { MIC_CONSTRAINTS, micErrorText } from "./voice";
@@ -80,11 +81,22 @@ export function useRemoteSession() {
   const [error, setError] = useState<string | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [facing, setFacing] = useState<Facing>("user");
+  // Server replies arrive up to 10 times a second. They are kept in refs and reach React (`msg`, `stats`) at most every UI_TICK_MS,
+  // or at once when something important changed (urgentChange): rendering the whole page per reply made phones stutter.
   const [msg, setMsg] = useState<ServerMsg | null>(null);
+  const msgRef = useRef<ServerMsg | null>(null);          // the newest telemetry
+  const shownMsg = useRef<ServerMsg | null>(null);        // what `msg` holds
   const [needsToken, setNeedsToken] = useState(false);   // the server wants an access token we do not have (or it was wrong)
   const token = useRef<string | null>(null);
   if (token.current === null) token.current = loadToken();
-  const [stats, setStats] = useState({ fps: 0, rtt: 0, longSide: MAX_QUALITY.longSide, inferMs: 0 });
+  const INITIAL_STATS = { fps: 0, rtt: 0, longSide: MAX_QUALITY.longSide, inferMs: 0 };
+  const [stats, setStats] = useState(INITIAL_STATS);
+  const shownStats = useRef(INITIAL_STATS);
+  const lastRecv = useRef(0);                              // when the server last said anything, and when we last sent something
+  const lastSent = useRef(0);                              // that wants an answer: together they tell a dead tunnel from a quiet one
+  const safetyQueue = useRef<{ name: string; at: number }[]>([]);   // ack / escalate typed while the link was down
+  const dropRef = useRef<(() => void) | null>(null);      // gives up on the current socket (set by connect)
+  const lastFrame = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const [engines, setEngines] = useState<string[]>([]);              // pose models the server offers to switch between
   const [engineWanted, setEngineWanted] = useState<string | null>(null);   // asked for, not yet confirmed by the server
   // On-device pose: the model runs in this browser and only joint positions are sent (no frames).
@@ -124,12 +136,31 @@ export function useRemoteSession() {
   const streamRef = useRef<MediaStream | null>(null);
   const facingRef = useRef<Facing>("user");
   const exerciseRef = useRef<string | null>(null); // re-sent after a reconnect (the server makes a fresh session)
-  const timers = useRef<{ reconnect?: number; pump?: number }>({});
+  const timers = useRef<{ reconnect?: number; pump?: number; ui?: number }>({});
   const attempts = useRef(0);
   const wake = useRef<WakeLockSentinel | null>(null);
-  const pumpState = useRef({ seq: 0, inflight: false, sentAt: 0, q: MAX_QUALITY as Quality, fps: 0, lastAck: 0, infer: 0 });
+  const pumpState = useRef({ seq: 0, inflight: false, sentAt: 0, q: MAX_QUALITY as Quality, fps: 0, lastAck: 0, infer: 0, rtt: 0 });
 
   const stopPump = () => { window.clearTimeout(timers.current.pump); timers.current.pump = undefined; };
+
+  const flushMsg = () => { if (msgRef.current !== shownMsg.current) { shownMsg.current = msgRef.current; setMsg(msgRef.current); } };
+  const flushStats = () => {
+    const p = pumpState.current, s = shownStats.current;
+    const next = { fps: Math.round(p.fps * 10) / 10, rtt: Math.round(p.rtt), longSide: p.q.longSide, inferMs: Math.round(p.infer * 10) / 10 };
+    if (next.fps !== s.fps || next.rtt !== s.rtt || next.longSide !== s.longSide || next.inferMs !== s.inferMs) { shownStats.current = next; setStats(next); }
+  };
+  const clearPose = () => poseListener.current?.(null, { w: 0, h: 0 });          // wipe the skeleton: it would look live
+
+  /** Every UI_TICK_MS while a session is wanted: bring React up to date, and check the tunnel. A quick tunnel can die without the
+   *  socket ever noticing, so the socket still reads OPEN while nothing is counted or watched: that is detected here. */
+  const uiTick = () => {
+    flushMsg();
+    flushStats();
+    if (document.hidden || !opened.current) return;      // a hidden tab sends nothing, so nothing can be missing
+    if (connectionLost(performance.now(), lastRecv.current, lastSent.current)) dropRef.current?.();
+  };
+  const startUiTick = () => { if (timers.current.ui === undefined) timers.current.ui = window.setInterval(uiTick, UI_TICK_MS); };
+  const stopUiTick = () => { window.clearInterval(timers.current.ui); timers.current.ui = undefined; };
 
   const startPump = useCallback(() => {
     stopPump();
@@ -149,7 +180,7 @@ export function useRemoteSession() {
         const seq = ++p.seq;
         p.inflight = true; p.sentAt = now;
         const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/jpeg", p.q.quality));
-        if (blob && sock.readyState === WebSocket.OPEN) sock.send(packFrame(seq, now, await blob.arrayBuffer()));
+        if (blob && sock.readyState === WebSocket.OPEN) { sock.send(packFrame(seq, now, await blob.arrayBuffer())); lastSent.current = performance.now(); }
         else p.inflight = false;
       }
       timers.current.pump = window.setTimeout(tick, 20);
@@ -190,6 +221,7 @@ export function useRemoteSession() {
         const sock = ws.current;
         if (sock && sock.readyState === WebSocket.OPEN && opened.current && sock.bufferedAmount < 65536) {   // never build a backlog
           sock.send(keypointMessage(++kpSeq.current, tMs, w, h, kp ?? {}, kp ? world : undefined));
+          lastSent.current = performance.now();
         }
       },
       stats: (fps, ms) => setLocal((l) => ({ ...l, fps, ms })),
@@ -220,14 +252,19 @@ export function useRemoteSession() {
     // The token goes in the first message, not the address, so it never shows up in server or tunnel logs.
     sock.onopen = () => { if (token.current) sock.send(JSON.stringify({ type: "auth", token: token.current })); };
     sock.onmessage = (e) => {
+      lastRecv.current = performance.now();                       // any message proves the link is alive
       if (typeof e.data !== "string") return;
       const m = JSON.parse(e.data) as ServerMsg;
       const p = pumpState.current;
       if (m.type === "hello") {
         opened.current = true; attempts.current = 0;
+        lastSent.current = lastRecv.current;                      // nothing is owed yet
         setError(null); setStatus("live");
         setEngines(m.engines ?? []);
         if (exerciseRef.current) sock.send(JSON.stringify({ type: "cmd", name: "exercise", value: exerciseRef.current }));
+        const queued = safetyQueue.current.splice(0);             // ack / escalate typed while the link was down
+        for (const q of queued) if (performance.now() - q.at < SAFETY_MAX_AGE_MS) sock.send(JSON.stringify({ type: "cmd", name: q.name }));
+        startUiTick();
         startActive();
       } else if (m.type === "t") {
         const now = performance.now();
@@ -237,11 +274,17 @@ export function useRemoteSession() {
           p.q = nextQuality(p.q, rtt);
           if (p.lastAck) p.fps = 0.8 * p.fps + 0.2 * (1000 / Math.max(now - p.lastAck, 1));
           p.lastAck = now;
+          p.rtt = rtt;
           if (m.infer_ms !== undefined) p.infer = p.infer ? 0.8 * p.infer + 0.2 * m.infer_ms : m.infer_ms;   // smoothed model time
-          setStats({ fps: Math.round(p.fps * 10) / 10, rtt: Math.round(rtt), longSide: p.q.longSide, inferMs: Math.round(p.infer * 10) / 10 });
         }
-        if (m.exercise !== undefined) setMsg(m);                  // a bare error reply carries no telemetry
-        else if (m.error) setError(m.error);
+        if (m.frame) lastFrame.current = m.frame;
+        // the server's pose (server inference) is drawn straight onto the canvas, like the on-device one: never through state
+        if (inferenceRef.current === "server" && m.pose !== undefined) poseListener.current?.(m.pose as Pose | null, m.frame ?? lastFrame.current);
+        if (m.exercise !== undefined) {                           // a bare error reply carries no telemetry
+          const urgent = urgentChange(msgRef.current, m);
+          msgRef.current = m;
+          if (urgent) flushMsg();                                 // otherwise the next UI tick shows it
+        } else if (m.error) setError(m.error);
       } else if (m.type === "cmd_result" && !m.ok) {
         if (m.name === "engine") setEngineWanted(null);
         setError(m.error ?? `${m.name} failed`);
@@ -251,26 +294,37 @@ export function useRemoteSession() {
         waiting?.({ ok: !!m.ok, text: m.text, intent: m.intent, error: m.error, status: m.status });
       }
     };
-    sock.onclose = (ev) => {
+    /** The socket is gone: closed by either side, or given up on by the watchdog (a dead tunnel never closes it). */
+    const closed = (code: number) => {
+      if (ws.current !== sock) return;                             // an older socket, or stop() already took care of it
       stopPump();
       stopLocal();                                                 // restarted by the next hello
-      if (ws.current === sock) ws.current = null;
+      ws.current = null;
+      msgRef.current = null; shownMsg.current = null; setMsg(null);   // the reps of a dead session must not look live
+      clearPose();
       if (!want.current) return;
-      if (ev.code === 4401) {                                      // token missing or wrong: retrying cannot help
+      if (code === 4401) {                                         // token missing or wrong: retrying cannot help
         token.current = ""; saveToken("");
         stop();
         setNeedsToken(true);
         setError("The access token is missing or wrong.");
         return;
       }
-      if (ev.code === 1013) setError("The server is full or temporarily locked. Retrying…");
+      if (code === 1013) setError("The server is full or temporarily locked. Retrying…");
       setStatus("reconnecting");
       if (!opened.current && attempts.current === 0) {            // refused straight away: say why, once
         fetch("/api/health").then((r) => r.json()).then((h) => { if (h.remote_sessions === false) setError(HEALTH_HINT); }).catch(() => {});
       }
+      opened.current = false;
       timers.current.reconnect = window.setTimeout(connect, reconnectDelay(attempts.current++));
     };
+    sock.onclose = (ev) => closed(ev.code);
     sock.onerror = () => sock.close();
+    dropRef.current = () => {                                      // the watchdog: no word from the server for too long
+      sock.onclose = null; sock.onmessage = null; sock.onerror = null;
+      try { sock.close(); } catch { /* already gone */ }
+      closed(1006);
+    };
     setStatus((s) => (s === "live" ? s : "connecting"));
   }, [startActive]);
 
@@ -294,8 +348,12 @@ export function useRemoteSession() {
     streamRef.current = null;
     endVoice();
     releaseWake();
+    stopUiTick();
+    safetyQueue.current = [];
+    msgRef.current = null; shownMsg.current = null;
+    clearPose();
     setStream(null); setMsg(null); setStatus("idle");
-    setStats({ fps: 0, rtt: 0, longSide: MAX_QUALITY.longSide, inferMs: 0 });
+    shownStats.current = INITIAL_STATS; setStats(INITIAL_STATS);
     setEngines([]); setEngineWanted(null);
     stopLocal();
     setLocal((l) => ({ ...l, fps: 0, ms: 0, status: "idle" }));
@@ -308,7 +366,7 @@ export function useRemoteSession() {
     if (pin !== undefined && pin.trim()) { token.current = pin.trim(); saveToken(token.current); }
     setError(null); setStatus("starting");
     attempts.current = 0;
-    pumpState.current = { seq: 0, inflight: false, sentAt: 0, q: MAX_QUALITY, fps: 0, lastAck: 0, infer: 0 };
+    pumpState.current = { seq: 0, inflight: false, sentAt: 0, q: MAX_QUALITY, fps: 0, lastAck: 0, infer: 0, rtt: 0 };
     try {
       // Ask before opening the camera: no point in a permission prompt if the server will refuse us anyway.
       const h = await fetch("/api/health").then((r) => r.json()).catch(() => null);
@@ -372,7 +430,17 @@ export function useRemoteSession() {
 
   const send = useCallback((name: string, value?: string) => {
     if (name === "exercise" && value) exerciseRef.current = value;
-    if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify({ type: "cmd", name, value }));
+    const sock = ws.current;
+    if (sock?.readyState === WebSocket.OPEN && opened.current) {
+      sock.send(JSON.stringify({ type: "cmd", name, value }));
+      lastSent.current = performance.now();
+    } else if (want.current && SAFETY_COMMANDS.includes(name)) {
+      // The link is down: an answer to a fall check must not be lost with it. It is sent as soon as the next connection is up.
+      const q = safetyQueue.current;
+      if (!q.some((c) => c.name === name)) q.push({ name, at: performance.now() });
+      if (q.length > SAFETY_QUEUE_MAX) q.shift();
+      setError("No connection. Your answer will be sent as soon as it is back.");
+    }
   }, []);
 
   /** Ask the server for another pose model. It applies between batches and loading can take seconds, so the page keeps showing
@@ -402,7 +470,11 @@ export function useRemoteSession() {
   }, [setInference, setEngine, engine]);
 
   useEffect(() => {
-    const onVisible = () => { if (document.visibilityState === "visible") void holdWake(); };   // the lock is dropped when hidden
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      lastRecv.current = lastSent.current = performance.now();      // a hidden tab sends nothing: do not mistake the silence for a dead link
+      void holdWake();                                              // the lock is dropped when hidden
+    };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
@@ -427,7 +499,7 @@ export function useRemoteSession() {
     engine, engines, engineWanted, setEngine,
     inference, local, models, model, modelMs, modelWanted, setModel, setPoseListener,
     voice,
-    pose: msg?.pose ?? null, frame: msg?.frame ?? null,
+    frame: msg?.frame ?? null,
     start, stop, switchCamera, send,
   };
 }

@@ -3,7 +3,7 @@
   "appName": "AI Fitness Tracker",
   "webDir": "dist",
   "server": {
-    "url": "https://yea-yards-boys-lists.trycloudflare.com",
+    "url": "https://lights-red-bare-disks.trycloudflare.com",
     "cleartext": false
   },
   "android": {

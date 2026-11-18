@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { AlertTriangle, Cpu, Loader2, Maximize2, Minimize2, Pause, Play, SwitchCamera } from "lucide-react";
+import { AlertTriangle, Cpu, Loader2, Maximize2, Minimize2, Pause, Play, SwitchCamera, WifiOff } from "lucide-react";
 import type { Limb } from "../useTelemetry";
 import { engineLabel } from "./logic";
 
@@ -20,13 +20,16 @@ export type HudProps = {
   onPause: () => void;                                  // counting -> standby
   extra?: ReactNode;                                    // the voice chip
   note?: string;                                        // e.g. "calibrated rest 92°": what the standby measured for this person
+  lost?: boolean;                                       // the link to the server dropped: show the "Connection lost" banner
 };
 
 const TONE = { ok: "bg-emerald-400", warn: "bg-amber-400", bad: "bg-red-500" } as const;
 const SIDE: Record<string, string> = { L: "Left", R: "Right", B: "" };
 
-const btnBase = "pointer-events-auto flex min-h-10 items-center gap-2 rounded-full px-3 py-1 text-xs backdrop-blur disabled:cursor-default";
-const btn = `${btnBase} bg-slate-900/80 font-medium text-slate-100 hover:bg-slate-800 disabled:hover:bg-slate-900/80`;
+// No backdrop-blur / blur anywhere in the HUD: it sits over a live video, so a blur would be recomputed on every video frame
+// (a stutter on mid-range phone GPUs). A plain translucent fill reads just as well.
+const btnBase = "pointer-events-auto flex min-h-10 items-center gap-2 rounded-full px-3 py-1 text-xs disabled:cursor-default";
+const btn = `${btnBase} bg-slate-900/90 font-medium text-slate-100 hover:bg-slate-800 disabled:hover:bg-slate-900/90`;
 const btnStart = `${btnBase} bg-emerald-500 font-bold text-slate-950 hover:bg-emerald-400`;
 
 /** The top strip over the video, the same in both modes and in full screen: the status and the READY / ACTIVE badge, the rep
@@ -37,18 +40,25 @@ export function Hud(p: HudProps) {
   const standby = p.counting === false;
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex flex-col gap-2 bg-gradient-to-b from-black/75 via-black/40 to-transparent p-2 sm:p-3">
+      {p.lost && (
+        // the tunnel or Wi-Fi dropped: nothing is being counted or watched on the server until it is back (the reps are hidden)
+        <div role="alert" className="flex animate-pulse flex-wrap items-center justify-center gap-x-2 rounded-lg bg-red-600 px-3 py-2 text-sm font-bold text-white">
+          <WifiOff size={16} /> Connection lost — reconnecting…
+          <span className="text-xs font-normal">Reps and fall monitoring are paused</span>
+        </div>
+      )}
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="flex items-center gap-2 rounded-full bg-slate-900/80 px-3 py-1 text-xs backdrop-blur">
+          <span className="flex items-center gap-2 rounded-full bg-slate-900/90 px-3 py-1 text-xs">
             <span className={`h-2 w-2 rounded-full ${TONE[p.statusTone]}`} />{p.status}
           </span>
           {p.counting !== undefined && (
-            <span role="status" className={`rounded-full px-3 py-1 text-xs font-bold backdrop-blur ${standby ? "bg-amber-400 text-slate-950" : "bg-emerald-500 text-slate-950"}`}>
+            <span role="status" className={`rounded-full px-3 py-1 text-xs font-bold ${standby ? "bg-amber-400 text-slate-950" : "bg-emerald-500 text-slate-950"}`}>
               {standby ? "READY — Say “Let’s go” to start" : "ACTIVE"}
             </span>
           )}
           {p.note && !standby && (
-            <span className="rounded-full bg-slate-900/80 px-3 py-1 text-xs text-slate-300 backdrop-blur" title="Your starting angle, measured while you held still before you started">
+            <span className="rounded-full bg-slate-900/90 px-3 py-1 text-xs text-slate-300" title="Your starting angle, measured while you held still before you started">
               {p.note}
             </span>
           )}
@@ -82,7 +92,7 @@ export function Hud(p: HudProps) {
       </div>
 
       <div className="flex items-end justify-between gap-3">
-        <div className={`flex flex-1 items-end justify-center gap-6 text-white [text-shadow:0_2px_8px_rgb(0_0_0/0.8)] ${standby ? "opacity-60" : ""}`} aria-label="Repetitions">
+        <div className={`flex flex-1 items-end justify-center gap-6 text-white [text-shadow:0_1px_2px_rgb(0_0_0/0.9)] ${standby ? "opacity-60" : ""}`} aria-label="Repetitions">
           {entries.map(([side, limb]) => (
             <div key={side} className="flex items-baseline gap-2">
               <span className="text-6xl font-black leading-none tabular-nums sm:text-7xl">{limb.reps}</span>

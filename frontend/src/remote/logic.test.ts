@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { calibrationNote, worldToJoints } from "./logic";
 import { LANDMARK_JOINTS, MAX_LOCAL_FPS, ON_DEVICE, bboxFromKeypoints, canRunInference, defaultInference, isMobileDevice, keypointMessage, landmarksToKeypoints } from "./logic";
-import { ACK_TIMEOUT_MS, MAX_QUALITY, MIN_FRAME_GAP_MS, MIN_QUALITY, SKELETON, canSendFrame, captureSize, drawPose, engineLabel, extractToken, fitContain, isLocalHost, nextEngine, nextQuality, packFrame, reconnectDelay, type Pose } from "./logic";
+import { ACK_TIMEOUT_MS, SAFETY_COMMANDS, connectionLost, urgentChange, MAX_QUALITY, MIN_FRAME_GAP_MS, MIN_QUALITY, SKELETON, canSendFrame, captureSize, drawPose, engineLabel, extractToken, fitContain, isLocalHost, nextEngine, nextQuality, packFrame, reconnectDelay, type Pose } from "./logic";
 
 const bytes = (b: ArrayBuffer) => Array.from(new Uint8Array(b));
 
@@ -159,6 +159,40 @@ describe("world landmarks and the calibration note", () => {
 
 describe("engineLabel for the Lite model", () => {
   it("names it", () => expect(engineLabel("mediapipe_lite")).toBe("MediaPipe Lite"));
+});
+
+describe("connectionLost (the dead-tunnel watchdog)", () => {
+  it("is lost only when we sent something and nothing came back for too long", () => {
+    expect(connectionLost(10_000, 5_000, 9_900)).toBe(true);        // 5 s of silence while sending
+    expect(connectionLost(8_000, 5_000, 7_900)).toBe(false);        // 3 s: still within the allowance
+    expect(connectionLost(10_000, 9_900, 9_950)).toBe(false);       // the server answered a moment ago
+  });
+  it("owes nothing when nothing was sent after the last reply (hidden tab, model loading)", () => {
+    expect(connectionLost(60_000, 5_000, 4_000)).toBe(false);
+    expect(connectionLost(60_000, 5_000, 5_000)).toBe(false);
+  });
+});
+
+describe("urgentChange (what may not wait for the next UI tick)", () => {
+  const base = { exercise: "Elbow Curl", counting: true, engine: "device", error: null, fall: { status: "NORMAL", alert: { state: "IDLE" } }, reps: { L: { reps: 2 }, R: { reps: 1 } } };
+  it("is urgent for the first message", () => expect(urgentChange(null, base)).toBe(true));
+  it("is not urgent for the same state again", () => expect(urgentChange(base, { ...base })).toBe(false));
+  it.each([
+    ["a fall status", { fall: { status: "SUSPECTED", alert: { state: "IDLE" } } }],
+    ["an alert state", { fall: { status: "NORMAL", alert: { state: "COUNTDOWN" } } }],
+    ["standby / counting", { counting: false }],
+    ["a new exercise", { exercise: "Knee Flexion" }],
+    ["a new model", { engine: "yolo" }],
+    ["an error", { error: "boom" }],
+    ["a completed rep", { reps: { L: { reps: 3 }, R: { reps: 1 } } }],
+  ])("is urgent for %s", (_what, change) => expect(urgentChange(base, { ...base, ...change })).toBe(true));
+});
+
+describe("safety commands", () => {
+  it("are the ones that answer a fall check", () => {
+    expect(SAFETY_COMMANDS).toEqual(expect.arrayContaining(["ack_fall", "escalate"]));
+    expect(SAFETY_COMMANDS).not.toContain("start_session");
+  });
 });
 
 describe("reconnectDelay", () => {

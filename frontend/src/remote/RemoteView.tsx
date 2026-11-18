@@ -41,10 +41,10 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
     drawPose(ctx, pose, frame, sz, levelRef.current);
   }, []);
 
-  useEffect(() => {                                      // on-device pose: the model's output is drawn directly, never via state
-    s.setPoseListener(s.inference === "device" ? (pose, frame) => { lastLocal.current = { pose, frame }; paint(pose, frame); } : null);
+  useEffect(() => {                                      // every pose (the phone's model or the server's answer) is drawn directly, never via state
+    s.setPoseListener((pose, frame) => { lastLocal.current = { pose, frame }; paint(pose, frame); });
     return () => s.setPoseListener(null);
-  }, [s.inference, s.setPoseListener, paint]);   // eslint-disable-line react-hooks/exhaustive-deps -- `s` itself changes every render
+  }, [s.setPoseListener, paint]);   // eslint-disable-line react-hooks/exhaustive-deps -- `s` itself changes every render
 
   useEffect(() => {
     const v = s.videoRef.current;
@@ -63,14 +63,10 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
     return () => ro.disconnect();
   }, []);
 
-  useEffect(() => {                                      // redraw on a new pose, a resize, or a change of alert colour
-    if (s.inference === "device") {                      // the model drives its own drawing; this repaints the last pose after a resize
-      const last = lastLocal.current;
-      paint(last ? last.pose : null, last ? last.frame : { w: 0, h: 0 });
-      return;
-    }
-    paint(s.pose as Pose | null, s.frame ?? { w: 0, h: 0 });   // the server's pose, from its latest answer
-  }, [s.pose, s.frame, size, level, s.inference, paint]);
+  useEffect(() => {                                      // new poses draw themselves; this repaints the last one after a resize or an alert colour change
+    const last = lastLocal.current;
+    paint(last ? last.pose : null, last ? last.frame : { w: 0, h: 0 });
+  }, [size, level, paint]);
 
   const ratio = s.frame ? `${s.frame.w} / ${s.frame.h}` : "4 / 3";
   return (
@@ -86,6 +82,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
       <Hud
         status={`${s.status === "live" ? (t?.pose_visible ? `LIVE · ${t.posture ?? "pose"}` : "LIVE · no pose") : STATUS_TEXT[s.status]}${hidden && running ? " · privacy" : ""}`}
         statusTone={s.status === "live" ? "ok" : s.status === "error" ? "bad" : "warn"}
+        lost={running && s.status === "reconnecting"}
         counting={s.status === "live" ? t?.counting : undefined}
         reps={s.status === "live" ? t?.reps : undefined}
         note={s.status === "live" ? calibrationNote(t?.reps) : undefined}
