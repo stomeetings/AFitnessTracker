@@ -99,6 +99,10 @@ def classify_command(text: str) -> str | None:
     words = s.split()
     if "not" in words:
         return None
+    if re.fullmatch(r"(please )?(pause|hold( on)?)( please)?", s):        # bare words only: "pause the session" stays a stop
+        return "pause_session"
+    if re.fullmatch(r"(please )?resume( please)?", s):
+        return "resume_session"
     if re.search(r"\b(let s|lets|let us) go\b", s) and len(words) <= 6:      # "let's go", "lets go", "okay let us go"
         return "start_session"
     session = any(_is_noun(w, "session") for w in words)

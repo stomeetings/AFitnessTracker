@@ -1010,6 +1010,47 @@ only with sign-off; Capacitor native only when background fall monitoring is req
 - Still open before any commit: remove the real `REMOTE_SESSIONS` / `REMOTE_ACCESS_TOKEN` lines from `backend/.env.example`,
   rotate the token; keep `docs/sample/` and `backend/.env` out of git.
 
+### Start countdown and preview speech cues (2026-11-18)
+
+- New `frontend/src/cues.ts`: `speak()` (speechSynthesis, silent if unsupported) and `runCountdown()` ("Ready...", 3, 2, 1, "Go!", one `setTimeout` per step, cancellable).
+- `App.tsx`: the Start button and the voice command "start_session" show a non-blocking overlay (`pointer-events-none`, no blur) and speak each step; the Exercise Guide ("preview") opening/closing says "Displaying preview" / "Closing preview" (skipped while a countdown is speaking).
+- Nothing touches the frame loop, the pose code or the server. Reps still start counting immediately on Start (the overlay is a cue only). Phone check pending; tsc/vitest/build not yet run.
+
+### Desktop speech: no cancel() directly before speak() (2026-11-18)
+
+- `cues.ts` browser path: an urgent phrase calls `cancel()` and speaks 30 ms later (Windows/Chrome drops a `speak()` issued in the same tick as `cancel()`); a non-urgent phrase that arrives inside that window is deferred by 30 ms too so the order holds. `resume()` still runs before every speak; utterance `Set` + `onend`/`onerror` cleanup and the throttled touch/click/keydown unlock are unchanged (the function is `unlockSpeech`). Native path: errors (sync or promise) are caught and `console.warn`ed, never thrown into the UI.
+- tsc/vitest/build to be re-run by the user. Frame loop untouched.
+
+### Native Capacitor TTS in the APK (2026-11-18)
+
+- `cues.ts`: `speak()` uses `TextToSpeech.speak({ text, lang: "en-US", rate 1, pitch 1, volume 1, category: "ambient" })` from `@capacitor-community/text-to-speech` when `Capacitor.isNativePlatform()`; browsers keep the `speechSynthesis` path (utterance Set, resume, touch unlock). `unlockSpeech()` does nothing on native. Same phrases for countdown, preview, Paused, Resuming.
+- Plugin version 8.0.2 (peer `@capacitor/core >=8`, the project has ^8.6.2) is the one to install: `cd frontend && npm install @capacitor-community/text-to-speech`, then the APK script runs `cap sync` (rebuild needed). Not installed by me (no shell), so tsc/build fail until it is. Option names/queue strategy come from memory of the plugin API, not from its README (could not be fetched): tsc will flag any wrong field. Phone check pending.
+
+### Back to spoken cues (2026-11-18)
+
+- On request, Web Audio chimes were replaced by `speechSynthesis` again (`cues.ts` rewritten; chime code removed). Phrases: "Ready", "3", "2", "1", "Go!"; "OK, displaying preview" / "OK, closing preview"; pause/resume say "Paused" / "Resuming" (urgent: they replace what is playing).
+- Android/WebView fixes: module-level `Set` keeps live utterances (GC cut-off); `lang = "en-US"`; `if (paused) resume()` before every speak; `unlockSpeech()` keeps capture-phase listeners (pointerdown, touchstart, click, keydown) that send a zero-volume utterance on a touch (at most once per 5 s) to wake the TTS engine. Queued phrases do not cancel each other; only the countdown's first word and pause/resume replace playing speech.
+- `App.tsx` calls changed (`cue`, `unlockSpeech`). Frame loop untouched. Phone check pending; the Capacitor WebView may have no TTS engine at all (see the reply).
+
+### Chimes inaudible on mobile after voice commands: fix (2026-11-18)
+
+- Cause: `chime()` called `ctx.resume()` and returned at once when the state was not yet "running" (resume is asynchronous), and the unlock listener removed itself after the first tap, so a context the system suspended later (microphone opened for voice) stayed silent for voice-triggered chimes.
+- Fix in `cues.ts` only: `chime()` is async and awaits `resume()` before playing; `unlockAudio()` now keeps capture-phase listeners (pointerdown, touchstart, click, keydown) that create/resume the context and play a 1-sample silent buffer (the iOS unlock) on every touch, and returns a cleanup function (`App.tsx` effect). Peak gains 0.4-0.5 (were 0.14-0.25), notes moved to 523-880 Hz, scheduled 10 ms ahead.
+- No frame-loop code touched. Phone check pending (still silent -> the phone's media volume, silent switch on iPhone, or the microphone routing audio to the quiet call stream).
+
+### Web Audio chimes and voice pause/resume (2026-11-18)
+
+- `cues.ts` rewritten: speech synthesis removed. `chime(name)` plays short sine tones (ready, tick, go, previewOpen, previewClose, pause) with a 8 ms attack and exponential decay, scheduled on `AudioContext.currentTime` (no files). The context is created/resumed on the first tap (`unlockAudio`, needed by iOS Safari); silent if audio is blocked. Countdown: ready, tick x3, go chime. Preview open/close: soft two-note tones.
+- Voice pause/resume (server, same Groq path as the other commands): bare "pause" / "hold" / "hold on" / "hold please" -> `pause_session`; bare "resume" -> `resume_session`. `Session.request_pause()` (only while counting; keeps the counts) / `request_resume()` (no reset); `Session.paused`. While paused, "let's go" or a spoken "start session" is turned into `resume_session`. The HUD Start button and `request_start` still reset. "pause the session" is still `stop_session`.
+- `App.tsx`: `pause_session` / `resume_session` act immediately (no 700 ms delay): a "Paused" card (centred, pointer-events-none) with a pause chime; resume plays the go chime. All timers/UI state, nothing in the frame loop.
+- Test `test_voice_pause_keeps_the_counts_and_lets_go_resumes_without_a_reset`. Not run yet; phone check pending. The browser's own speech recognition is not used: commands come from the existing server-side voice path (it needs the Groq key and the mic button).
+
+### Countdown overlay and speech fixes (2026-11-18)
+
+- Overlay moved INSIDE the video `<section>` (`absolute inset-0`, flex-centred): the old `fixed` one outside it was invisible in full screen (only the fullscreen element is drawn). Large `text-6xl/7xl` bold number on a dark translucent bordered card, `pointer-events-none`. No `backdrop-blur` (rule: no blur over live video); `bg-slate-950/70` gives the same look cheaply.
+- `cues.ts` speech: utterances are held in a module `Set` until they end (Android Chrome drops unreferenced ones); phrases are queued, not cancelled (only the countdown's first word clears older speech); a paused queue is resumed; `unlockSpeech()` speaks one silent utterance on the first tap so voice-command/timer speech is allowed on mobile.
+- Preview phrases now queue instead of interrupting. Nothing touches the frame loop. tsc/vitest/build and phone check pending.
+
 ### Pre-commit sanitization (2026-11-18)
 
 - `frontend/android/gradle.properties`: `org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8` (was -Xmx1536m; the first Gradle run had been

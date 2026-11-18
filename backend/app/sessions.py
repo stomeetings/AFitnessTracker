@@ -66,6 +66,7 @@ class Session:
         self.pending_reset = False
         self.pending_baseline_reset = False
         self.pending_counting: bool | None = None
+        self.paused = False                 # paused by voice: "let's go" / "resume" continue instead of resetting
 
     # ---- lifecycle ----------------------------------------------------------------------------------------------
 
@@ -96,10 +97,26 @@ class Session:
         """"Let's go" / Start: counters back to 0 and rep counting on."""
         self.pending_reset = True
         self.pending_counting = True
+        self.paused = False
 
     def request_stop(self) -> None:
         """Pause rep counting and go back to standby (the counts stay on screen until the next start)."""
         self.pending_counting = False
+        self.paused = False
+
+    def request_pause(self) -> bool:
+        """Voice "pause" / "hold please": counting stops but the counts stay, and request_resume() continues them. Only a
+        running session can be paused (False otherwise)."""
+        if not (self.pending_counting if self.pending_counting is not None else self.pipeline.counting):
+            return False
+        self.pending_counting = False
+        self.paused = True
+        return True
+
+    def request_resume(self) -> None:
+        """Counting on again WITHOUT the reset that request_start() does."""
+        self.pending_counting = True
+        self.paused = False
 
     def request_baseline_reset(self) -> None:
         """The camera moved or was switched: relearn the standing baseline (applied by the feeder thread)."""

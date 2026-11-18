@@ -10,6 +10,7 @@ import { Hud } from "./remote/Hud";
 import { useFullscreen } from "./remote/useFullscreen";
 import { VOICE_HELP, VoiceChip } from "./remote/VoiceChip";
 import { intentEffects } from "./remote/voice";
+import { cue, runCountdown, unlockSpeech } from "./cues";
 import { useTelemetry, type Limb } from "./useTelemetry";
 
 const ENGINES = [
@@ -147,7 +148,23 @@ export default function App() {
   // Standby / active: a phone session starts in standby (skeleton live, reps NOT counted) so stepping into the frame cannot
   // score; "let's go" / "start my session" / the Start button reset the counts to 0 and start counting, and close the guide.
   // Pause (or "stop session" on the desktop) goes back to standby. The voice commands do the same on the server (voicecmd.py).
-  const startSession = () => { setGuideOpen(false); if (device) remote.send("start_session"); else void post("/api/session/start"); };
+  // "Ready... 3 2 1 Go!" overlay + tones (cues.ts): timers only, never touches the frame loop. Restarting replaces a running one.
+  const [count, setCount] = useState<string | null>(null);
+  const [paused, setPaused] = useState(false);     // paused by voice ("pause" / "hold please"): the server keeps the counts
+  const stopCount = useRef<(() => void) | null>(null);
+  const countdown = () => {
+    stopCount.current?.();
+    stopCount.current = runCountdown((s) => { setCount(s); if (s === null) stopCount.current = null; });
+  };
+  useEffect(() => { const off = unlockSpeech(); return () => { off(); stopCount.current?.(); }; }, []);
+  // Preview (the Exercise Guide) opened/closed by button or voice: a soft tone. A session start closes the guide too, but its
+  // own countdown tones must not be talked over, hence the check.
+  const firstGuide = useRef(true);
+  useEffect(() => {
+    if (firstGuide.current) { firstGuide.current = false; return; }
+    if (!stopCount.current) cue(guideOpen ? "previewOpen" : "previewClose");
+  }, [guideOpen]);
+  const startSession = () => { setPaused(false); countdown(); setGuideOpen(false); if (device) remote.send("start_session"); else void post("/api/session/start"); };
   const pauseSession = () => { if (device) remote.send("stop_session"); else void post("/api/session/stop"); };
   const fs = useFullscreen();               // the video wrapper goes full screen with its HUD; modal dialogs still sit on top
 
@@ -177,10 +194,15 @@ export default function App() {
     if (!heardSeq) return;
     console.info("[voice] heard", JSON.stringify(voice.heard.text), "-> intent:", heardIntent);   // diagnostic: what the server understood
     if (!heardIntent) return;                        // talk that was not a command must not cancel one already waiting
+    // Pause / resume act at once (no 700 ms read-the-chip delay): the server has already changed state when it answered.
+    if (heardIntent === "pause_session") { stopCount.current?.(); setPaused(true); cue("pause", true); return; }
+    if (heardIntent === "resume_session") { setPaused(false); cue("resume", true); setGuideOpen(false); return; }
+    if (heardIntent === "stop_session") setPaused(false);
     // The chip shows `Heard: "..."` right away; the change itself follows a moment later so it can be read first.
     window.clearTimeout(commandTimer.current);       // a newer command replaces an older one that has not run yet
     commandTimer.current = window.setTimeout(() => {
       const fx = intentEffects(heardIntent, device);
+      if (heardIntent === "start_session") countdown();
       console.info("[voice] applying", heardIntent, fx);
       if (fx.showGuide !== undefined) setGuideOpen(fx.showGuide);      // the Exercise Guide: the same state the Info button sets
       if (fx.stopDeviceSession) remote.stop();
@@ -192,7 +214,7 @@ export default function App() {
   useEffect(() => {
     const was = lastStatus.current;
     lastStatus.current = remote.status;
-    if (remote.status === "idle" && was !== "idle" && was !== "starting") setGuideOpen(false);
+    if (remote.status === "idle" && was !== "idle" && was !== "starting") { setGuideOpen(false); setPaused(false); }
   }, [remote.status]);
   // Server camera: the browser microphone is opt-in (a tap; remembered, and restarted by itself when the browser has
   // already granted it). While the fall dialog is open the BACKEND's microphone answers it, so the browser releases its own.
@@ -268,6 +290,16 @@ export default function App() {
         <section ref={fs.ref}
           className={fs.full ? "fixed inset-0 z-40 overflow-hidden bg-black"
             : `relative overflow-hidden rounded-2xl border bg-black ${fall === "CONFIRMED" ? "border-red-500" : "border-slate-800"}`}>
+          {/* Inside the section so it is also visible in full screen (only the fullscreen element is drawn). No blur: it sits over live video. */}
+          {(count || paused) && (
+            <div aria-live="assertive" className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center p-4">
+              {count
+                ? <span key={count} className="min-w-[8rem] rounded-3xl border border-white/20 bg-slate-950/70 px-10 py-6 text-center text-6xl font-extrabold tracking-tight text-emerald-300 shadow-2xl sm:text-7xl">{count}</span>
+                : <span className="rounded-3xl border border-amber-300/40 bg-slate-950/70 px-8 py-5 text-center text-4xl font-extrabold tracking-tight text-amber-300 shadow-2xl sm:text-5xl">
+                    Paused<span className="mt-1 block text-base font-medium text-slate-300">Say “resume” or “let’s go” to continue</span>
+                  </span>}
+            </div>
+          )}
           {device ? (
             <RemoteView s={remote} hidden={privacyPref} level={fall === "CONFIRMED" ? "confirmed" : fall === "SUSPECTED" ? "suspected" : "ok"}
               full={fs.full} onToggleFull={fs.toggle} onStart={startSession} onPause={pauseSession} />

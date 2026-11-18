@@ -28,6 +28,7 @@ export function intentEffects(intent: string | null, deviceMode: boolean): { sho
   switch (intent) {
     case "show_preview": return { showGuide: true };
     case "hide_preview":
+    case "resume_session":      // "pause_session" changes nothing on the page but the Paused card (App)
     case "start_session": return { showGuide: false };
     case "stop_session": return { showGuide: false, stopDeviceSession: deviceMode };
     default: return {};
@@ -36,7 +37,7 @@ export function intentEffects(intent: string | null, deviceMode: boolean): { sho
 
 /** How a recognised command is shown on the chip, so "heard" and "understood" can be told apart. */
 export const intentLabel = (intent: string | null): string =>
-  ({ show_preview: "show preview", hide_preview: "hide preview", start_session: "start session", stop_session: "stop session",
+  ({ show_preview: "show preview", hide_preview: "hide preview", start_session: "start session", stop_session: "stop session", pause_session: "pause", resume_session: "resume",
      ok: "I am fine", help: "help" } as Record<string, string>)[intent ?? ""] ?? "not a command";
 
 /** Constraints for a speech microphone: the phone or laptop cancels what its own speaker plays. */

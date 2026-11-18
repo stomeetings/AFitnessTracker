@@ -41,7 +41,15 @@ def interpret(session: Session, listener: VoiceListener | None, text: str) -> st
     if alert in ACTIVE_ALERT_STATES:
         return listener.handle(text) if listener is not None else None
     intent = classify_command(text)
-    if intent == "start_session":
+    if intent == "start_session" and session.paused:
+        intent = "resume_session"           # after a voice pause, "let's go" continues; it does not reset the counts
+    if intent == "pause_session" and not session.request_pause():
+        return None                         # nothing running to pause
+    if intent == "resume_session":
+        if not session.paused:
+            return None
+        session.request_resume()
+    elif intent == "start_session":
         session.request_start()             # counters to 0 and rep counting on (it is paused in standby)
     elif intent == "stop_session":
         session.request_stop()              # rep counting back to standby; a phone also stops its camera (the page does that)

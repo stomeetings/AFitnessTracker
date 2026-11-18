@@ -3,7 +3,7 @@
   "appName": "AI Fitness Tracker",
   "webDir": "dist",
   "server": {
-    "url": "https://lights-red-bare-disks.trycloudflare.com",
+    "url": "https://governing-hash-controllers-holiday.trycloudflare.com",
     "cleartext": false
   },
   "android": {

@@ -1781,6 +1781,29 @@ def test_session_commands_are_understood_loosely_but_never_by_accident():
         assert c(text) is None, text
 
 
+def test_voice_pause_keeps_the_counts_and_lets_go_resumes_without_a_reset():
+    from app.voice.intent import classify_command as c
+    from app.voicecmd import interpret
+    for text in ("Pause.", "hold please", "Hold on", "please pause"):
+        assert c(text) == "pause_session", text
+    assert c("Resume") == "resume_session" and c("pause the session") == "stop_session" and c("hold the door") is None
+    s = Session("p", standby=True)
+    assert interpret(s, None, "pause") is None and not s.paused              # nothing running: not a command
+    assert interpret(s, None, "resume") is None
+    s.request_start(); s.apply_pending()
+    assert interpret(s, None, "hold please") == "pause_session" and s.paused
+    s.apply_pending()
+    assert s.pipeline.counting is False and not s.pending_reset
+    assert interpret(s, None, "let's go") == "resume_session"                # continues: no reset requested
+    assert s.pending_counting is True and not s.pending_reset and not s.paused
+    s.apply_pending()
+    assert s.pipeline.counting is True
+    interpret(s, None, "pause"); s.apply_pending()
+    assert interpret(s, None, "start my session") == "resume_session"        # a spoken start after a pause resumes too
+    s.request_start()
+    assert s.pending_reset and not s.paused                                  # the Start button still resets
+
+
 def test_transcribe_names_the_audio_format_it_is_given():
     from app.voice import groq_stt
     seen = {}
