@@ -1,5 +1,5 @@
 import type { PoseLandmarker } from "@mediapipe/tasks-vision";
-import { canRunInference, landmarksToKeypoints, worldToJoints, type Keypoints, type World } from "./logic";
+import { canRunInference, landmarksToKeypointsInto, worldToJointsInto, type Keypoints, type World } from "./logic";
 
 /** MediaPipe Pose Landmarker running in this browser (WebAssembly, on the GPU where the phone allows it): the pose is computed
  *  where the camera is, so no video crosses the network, and the skeleton is drawn from the same pass with no round trip.
@@ -44,7 +44,9 @@ export async function createLandmarker(): Promise<LoadedLandmarker> {
 
 export type LoopHooks = {
   /** One result per processed video frame: the joints in pixels of the w x h frame (null = nobody found), its time, and the
-   *  metric 3D world joints when the model gave them (the server then measures angles independent of the view). */
+   *  metric 3D world joints when the model gave them (the server then measures angles independent of the view).
+   *  `kp` and `world` are the loop's own REUSED buffers, overwritten by the next frame: use them inside this call (draw, serialise)
+   *  and never keep a reference; copy what must outlive the call. */
   pose: (kp: Keypoints | null, w: number, h: number, tMs: number, world?: World) => void;
   /** About twice a second: frames per second achieved and the smoothed time one detection takes, in ms. */
   stats: (fps: number, ms: number) => void;
@@ -58,6 +60,7 @@ export function runLocalLoop(getVideo: () => HTMLVideoElement | null, landmarker
   let stopped = false, handle = 0;
   let lastRun = 0, lastTs = 0, lastVideoTime = -1, lastStats = 0, fps = 0, ms = 0;
   const round1 = (n: number) => Math.round(n * 10) / 10;
+  const kpBuf: Keypoints = {}, worldBuf: World = {};        // allocated once per loop; every frame overwrites them in place
 
   const tick = () => {
     if (stopped) return;
@@ -77,8 +80,8 @@ export function runLocalLoop(getVideo: () => HTMLVideoElement | null, landmarker
         lastRun = now;
         const lm = result.landmarks[0];
         const wl = result.worldLandmarks?.[0];
-        on.pose(lm ? landmarksToKeypoints(lm, video.videoWidth, video.videoHeight) : null, video.videoWidth, video.videoHeight, now,
-          lm && wl ? worldToJoints(wl) : undefined);
+        on.pose(lm ? landmarksToKeypointsInto(kpBuf, lm, video.videoWidth, video.videoHeight) : null, video.videoWidth, video.videoHeight, now,
+          lm && wl ? worldToJointsInto(worldBuf, wl) : undefined);
       } catch (e) {
         stopped = true;
         on.failed(e);

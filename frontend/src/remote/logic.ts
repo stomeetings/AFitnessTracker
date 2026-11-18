@@ -128,17 +128,84 @@ export const LANDMARK_JOINTS: Readonly<Record<number, string>> = {
   29: "l_heel", 30: "r_heel", 31: "l_foot_index", 32: "r_foot_index",
 };
 
-/** The 33 normalised landmarks (x, y in 0..1) as the 17 named joints in pixels of the w x h video frame, rounded to keep the
- *  message small. `visibility` is the confidence; a missing one counts as 0. */
-export function landmarksToKeypoints(landmarks: ReadonlyArray<{ x: number; y: number; visibility?: number }>, w: number, h: number): Keypoints {
-  const out: Keypoints = {};
-  for (const [index, name] of Object.entries(LANDMARK_JOINTS)) {
-    const lm = landmarks[Number(index)];
-    if (!lm) continue;
-    out[name] = [Math.round(lm.x * w * 10) / 10, Math.round(lm.y * h * 10) / 10, Math.round((lm.visibility ?? 0) * 100) / 100];
+// ---- Adaptive camera resolution --------------------------------------------------------------------------------------------------
+// The pose model reads about a 256 px crop whatever the camera delivers, so a bigger camera image only costs texture upload and
+// conversion on every frame. The camera therefore runs in tiers: a starting tier chosen from the device, stepped DOWN when the
+// model's own time stays over budget, and back UP (never above the ceiling) after a long stretch of headroom.
+
+export type CameraTier = "high" | "mid" | "low";
+export const TIER_ORDER: ReadonlyArray<CameraTier> = ["high", "mid", "low"];
+export const TIER_SIZE: Readonly<Record<CameraTier, { w: number; h: number }>> = {
+  high: { w: 1280, h: 720 }, mid: { w: 640, h: 480 }, low: { w: 480, h: 360 },
+};
+
+/** Where to start: a computer gets 720p; a phone 640x480, or 480x360 when it reports little memory (navigator.deviceMemory, Chrome
+ *  only) or few cores. Unknown values (iOS Safari reports neither) do not count against the phone. */
+export function initialTier(mobile: boolean, cores?: number, memoryGb?: number): CameraTier {
+  if (!mobile) return "high";
+  if ((memoryGb !== undefined && memoryGb <= 3) || (cores !== undefined && cores <= 4)) return "low";
+  return "mid";
+}
+/** The best tier the monitor may climb back to: phones stop at 640x480 (more pixels buy the pose model nothing). */
+export const tierCeiling = (mobile: boolean): CameraTier => (mobile ? "mid" : "high");
+
+/** `getUserMedia` / `applyConstraints` size for a tier. `ideal`, never `exact`: the camera picks its nearest mode instead of failing. */
+export const tierConstraints = (tier: CameraTier) => ({ width: { ideal: TIER_SIZE[tier].w }, height: { ideal: TIER_SIZE[tier].h } });
+
+const SLOW_MS = 33;            // the model alone takes longer than a 30 fps frame: over budget
+const SLOW_FPS = 15;           // below this with a model that is not cheap: the phone cannot keep up
+const FAST_MS = 16, FAST_FPS = 24;
+const DOWN_AFTER = 6;          // samples (one per 0.5 s): 3 s of trouble before stepping down
+const UP_AFTER = 40;           // 20 s of headroom before stepping up
+const SETTLE = 4;              // samples ignored after a change: the camera is still restarting
+
+/** Decides camera tier changes from the on-device loop's stats (call `sample` about every 0.5 s with the achieved fps and the
+ *  smoothed model ms). Returns the new tier when it changes, else null. Pure state, no timers: unit-tested. */
+export function createTierMonitor(start: CameraTier, ceiling: CameraTier = start) {
+  let index = TIER_ORDER.indexOf(start), slow = 0, fast = 0, settle = SETTLE;
+  const top = TIER_ORDER.indexOf(ceiling);
+  return {
+    get tier(): CameraTier { return TIER_ORDER[index]; },
+    sample(fps: number, ms: number): CameraTier | null {
+      if (settle > 0) { settle--; return null; }
+      const isSlow = ms > SLOW_MS || (fps > 0 && fps < SLOW_FPS && ms > 20);     // fps 0 = not measured yet
+      const isFast = ms > 0 && ms < FAST_MS && fps >= FAST_FPS;
+      slow = isSlow ? slow + 1 : 0;
+      fast = isFast ? fast + 1 : 0;
+      let next = index;
+      if (slow >= DOWN_AFTER && index < TIER_ORDER.length - 1) next = index + 1;
+      else if (fast >= UP_AFTER && index > top) next = index - 1;
+      if (next === index) return null;
+      index = next; slow = fast = 0; settle = SETTLE;
+      return TIER_ORDER[index];
+    },
+  };
+}
+
+// The landmark table as two plain arrays, built ONCE: the per-frame code walks them by index (no Object.entries, no iterator).
+const JOINT_INDEX: number[] = Object.keys(LANDMARK_JOINTS).map(Number);
+const JOINT_NAME: string[] = JOINT_INDEX.map((i) => LANDMARK_JOINTS[i]);
+
+/** Hot path (runs for every camera frame): fills `out` IN PLACE with the 33 normalised landmarks (x, y in 0..1) as the 17 named
+ *  joints in pixels of the w x h frame, rounded to keep the message small, and returns it. `out` keeps its joint arrays between
+ *  calls, so a steady stream of frames allocates nothing; a landmark that is missing is removed from `out`. `visibility` is the
+ *  confidence; a missing one counts as 0. The result is only valid until the next call: copy it if it must be kept. */
+export function landmarksToKeypointsInto(out: Keypoints, landmarks: ReadonlyArray<{ x: number; y: number; visibility?: number }>, w: number, h: number): Keypoints {
+  for (let k = 0; k < JOINT_NAME.length; k++) {
+    const name = JOINT_NAME[k], lm = landmarks[JOINT_INDEX[k]];
+    if (!lm) { delete out[name]; continue; }                 // never happens with MediaPipe's fixed 33; keeps "absent" meaning absent
+    let p = out[name];
+    if (!p) { p = [0, 0, 0]; out[name] = p; }                // the first frame only
+    p[0] = Math.round(lm.x * w * 10) / 10;
+    p[1] = Math.round(lm.y * h * 10) / 10;
+    p[2] = Math.round((lm.visibility ?? 0) * 100) / 100;
   }
   return out;
 }
+
+/** The same, into a fresh object (tests, one-off use). Not for the per-frame loop. */
+export const landmarksToKeypoints = (landmarks: ReadonlyArray<{ x: number; y: number; visibility?: number }>, w: number, h: number): Keypoints =>
+  landmarksToKeypointsInto({}, landmarks, w, h);
 
 /** Joint name -> [x, y, z] in METRES from the hip centre (MediaPipe's world landmarks), the same joint names as `Keypoints`. */
 export type World = Record<string, [number, number, number]>;
@@ -146,14 +213,21 @@ export type World = Record<string, [number, number, number]>;
 /** MediaPipe's 33 world landmarks as the 17 named joints, millimetre precision (3 decimals, metres). Angles measured in these do
  *  not depend on the camera's viewing angle, unlike angles measured in the image (a knee bending toward the camera barely changes
  *  in 2D). The server uses them when every joint of an angle has one. */
-export function worldToJoints(world: ReadonlyArray<{ x: number; y: number; z: number }>): World {
-  const out: World = {};
-  for (const [index, name] of Object.entries(LANDMARK_JOINTS)) {
-    const p = world[Number(index)];
-    if (p) out[name] = [Math.round(p.x * 1000) / 1000, Math.round(p.y * 1000) / 1000, Math.round(p.z * 1000) / 1000];
+export function worldToJointsInto(out: World, world: ReadonlyArray<{ x: number; y: number; z: number }>): World {
+  for (let k = 0; k < JOINT_NAME.length; k++) {                // hot path: in place, see landmarksToKeypointsInto
+    const name = JOINT_NAME[k], p = world[JOINT_INDEX[k]];
+    if (!p) { delete out[name]; continue; }
+    let q = out[name];
+    if (!q) { q = [0, 0, 0]; out[name] = q; }
+    q[0] = Math.round(p.x * 1000) / 1000;
+    q[1] = Math.round(p.y * 1000) / 1000;
+    q[2] = Math.round(p.z * 1000) / 1000;
   }
   return out;
 }
+
+/** The same, into a fresh object (tests, one-off use). Not for the per-frame loop. */
+export const worldToJoints = (world: ReadonlyArray<{ x: number; y: number; z: number }>): World => worldToJointsInto({}, world);
 
 /** What the HUD says about the rest angles measured in standby ("calibrated rest 92°"), or undefined when none was. */
 export function calibrationNote(reps?: Record<string, { calibrated?: boolean; rest?: number }>): string | undefined {
@@ -171,6 +245,25 @@ export function bboxFromKeypoints(kp: Keypoints, minConf = 0.5, pad = 0.05): [nu
   const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
   const px = (x1 - x0) * pad, py = (y1 - y0) * pad;
   return [x0 - px, y0 - py, x1 - x0 + 2 * px, y1 - y0 + 2 * py];
+}
+
+/** Hot-path twin of `bboxFromKeypoints`: writes the padded box into `out` ([x, y, w, h], reused) and returns true, or returns
+ *  false (out untouched) with fewer than 4 confident joints. No intermediate arrays. */
+export function bboxFromKeypointsInto(out: [number, number, number, number], kp: Keypoints, minConf = 0.5, pad = 0.05): boolean {
+  let n = 0, x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const name in kp) {
+    const p = kp[name];
+    if (p[2] < minConf) continue;
+    n++;
+    if (p[0] < x0) x0 = p[0];
+    if (p[0] > x1) x1 = p[0];
+    if (p[1] < y0) y0 = p[1];
+    if (p[1] > y1) y1 = p[1];
+  }
+  if (n < 4) return false;
+  const px = (x1 - x0) * pad, py = (y1 - y0) * pad;
+  out[0] = x0 - px; out[1] = y0 - py; out[2] = x1 - x0 + 2 * px; out[3] = y1 - y0 + 2 * py;
+  return true;
 }
 
 /** The `kp` message the server's gateway expects (backend/app/remote.py). `"type":"kp"` must come first: the server tells these
@@ -226,27 +319,30 @@ export function drawPose(
 ): void {
   ctx.clearRect(0, 0, box.w, box.h);
   if (!pose || !frame.w || !frame.h) return;
-  const f = fitContain(frame.w, frame.h, box.w, box.h);
-  const px = (x: number) => f.x + x * f.scale, py = (y: number) => f.y + y * f.scale;
-  const colors = LEVEL_COLOR[level];
-  const [bx, by, bw, bh] = pose.bbox;
+  // Hot path (every pose): no helper objects, no closures, no destructuring, no Object.values. The letterbox maths of fitContain
+  // is inlined (same formula), and everything is read by index or by key straight from the pose.
+  const scale = Math.min(box.w / frame.w, box.h / frame.h);
+  const ox = (box.w - frame.w * scale) / 2, oy = (box.h - frame.h * scale) / 2;
+  const colors = LEVEL_COLOR[level], kp = pose.kp, bb = pose.bbox;
   ctx.lineWidth = 2;
   ctx.strokeStyle = colors.box;
-  ctx.strokeRect(px(bx), py(by), bw * f.scale, bh * f.scale);
+  ctx.strokeRect(ox + bb[0] * scale, oy + bb[1] * scale, bb[2] * scale, bb[3] * scale);
   ctx.strokeStyle = colors.bone;
-  for (const [a, c] of SKELETON) {
-    const ka = pose.kp[a], kc = pose.kp[c];
+  for (let i = 0; i < SKELETON.length; i++) {
+    const bone = SKELETON[i], ka = kp[bone[0]], kc = kp[bone[1]];
     if (!ka || !kc || ka[2] < minConf || kc[2] < minConf) continue;
     ctx.beginPath();
-    ctx.moveTo(px(ka[0]), py(ka[1]));
-    ctx.lineTo(px(kc[0]), py(kc[1]));
+    ctx.moveTo(ox + ka[0] * scale, oy + ka[1] * scale);
+    ctx.lineTo(ox + kc[0] * scale, oy + kc[1] * scale);
     ctx.stroke();
   }
   ctx.fillStyle = "#ff5000";
-  for (const [x, y, conf] of Object.values(pose.kp)) {
-    if (conf < minConf) continue;
+  for (const name in kp) {
+    const p = kp[name];
+    if (p[2] < minConf) continue;
     ctx.beginPath();
-    ctx.arc(px(x), py(y), 4, 0, Math.PI * 2);
+    ctx.arc(ox + p[0] * scale, oy + p[1] * scale, 4, 0, TWO_PI);
     ctx.fill();
   }
 }
+const TWO_PI = Math.PI * 2;

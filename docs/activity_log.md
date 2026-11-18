@@ -1010,7 +1010,72 @@ only with sign-off; Capacitor native only when background fall monitoring is req
 - Still open before any commit: remove the real `REMOTE_SESSIONS` / `REMOTE_ACCESS_TOKEN` lines from `backend/.env.example`,
   rotate the token; keep `docs/sample/` and `backend/.env` out of git.
 
-### Audit fixes: telemetry re-render storm, dead-tunnel watchdog + banner, safety queue, HUD GPU effects (2026-11-18) — NOT yet run
+### Pre-commit sanitization (2026-11-18)
+
+- `frontend/android/gradle.properties`: `org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8` (was -Xmx1536m; the first Gradle run had been
+  killed for low system memory). Note the repo's Android project is `frontend/android`, not `android/`.
+- **Secret removed:** `backend/.env.example` had the live `REMOTE_SESSIONS=1` / `REMOTE_ACCESS_TOKEN=...` lines (and `ANGLES_3D=0`) appended
+  at the end. Replaced by commented, documented placeholders (`ANGLES_3D`, `SMOOTH_TAU_S`, `CALIBRATE`, `TUNNEL_URL`). The real values
+  already live in the git-ignored `backend/.env`. A repo-wide search found no other token, `gsk_` key or API key in tracked files.
+- `.gitignore`: added `docs/sample/` (people on the floor, never to be committed; the folder was empty/missing on disk when checked)
+  and `frontend/capacitor.config.json` (holds the temporary tunnel address; the APK script rewrites it).
+- Commit/push was NOT run by the assistant (no shell): commands were given to the user.
+
+### Adaptive camera resolution (2026-11-18) — frontend checks pass (tsc clean, vitest 74/74, build ok); phone check pending (roadmap B1 + B3, rules from the cv-fitness-pipeline skill)
+
+- **Why:** `openMedia` asked every device for 1280x720, but MediaPipe reads about a 256 px crop, so the extra pixels only cost
+  texture upload and conversion on every frame.
+- **Tiers** (`logic.ts`): `high` 1280x720, `mid` 640x480, `low` 480x360, requested as `ideal` (never `exact`: the browser picks its nearest
+  mode instead of failing). Start (`initialTier`): a computer = high (unchanged for the laptop); a phone = mid, or low when
+  `navigator.deviceMemory <= 3` or `hardwareConcurrency <= 4` (unknown values, e.g. iOS, do not count against a phone). A Galaxy A52 class
+  phone therefore starts at 640x480. Ceiling (`tierCeiling`): phones never climb above mid, computers up to high.
+- **Automatic fallback / recovery** (`createTierMonitor`, pure and unit-tested): fed every 0.5 s with the loop's fps and smoothed model ms.
+  Over budget (ms > 33, or fps < 15 with ms > 20) for 3 s = one tier down; fps >= 24 with ms < 16 for 20 s = one tier up (not above the
+  ceiling); the first 2 s after any change are ignored (the camera is restarting). A slow camera in a dim room with a cheap model (low
+  fps, low ms) does NOT step down: it is not the phone's fault and fewer pixels would not help.
+- **Applied without reopening the camera:** `applyTier` calls `track.applyConstraints(...)` on the running video track (reopening is what
+  gave "Could not start video source" on camera switches); if the camera refuses, it keeps its size. A tier an earlier session settled on
+  carries over to the next start and to a camera switch (`openMedia(..., tier)`).
+- **Aspect ratio and alignment:** nothing is hard-coded to the camera size. Every `kp` message carries its own `w`/`h` (the server rescales
+  by it), the loop passes `video.videoWidth/Height` of each frame to the listener and `drawPose` letterboxes by those, the canvas follows the
+  CSS box, and the preview is `object-contain`; so a size change between frames cannot misalign the skeleton. The preview box's aspect
+  ratio follows the telemetry's frame size (a computer stepping 16:9 -> 4:3 changes it; phones step 4:3 -> 4:3, so no layout jump).
+- **Server-inference mode:** the camera starts at its tier but is not stepped (that mode already adapts the size of the frames it sends,
+  `nextQuality`).
+- HUD: the panel line now ends "camera 640×480 · only joint positions are sent".
+- **To verify on the phone (cannot be tested here):** (1) the HUD panel shows 640×480 on the A52; (2) a forced slow period steps it to
+  480×360 and the skeleton stays aligned through the change; (3) MediaPipe keeps running through a size change in VIDEO mode (if the
+  loop ever stopped with "the server is doing it instead" right after a tier change, that is the cause: the fix would be to recreate
+  the landmarker on a change). Tests: +4 vitest. Verify: `npx tsc --noEmit`, `npm test`, `npm run build`.
+
+### Zero-allocation hot loop for the on-device pose path (2026-11-18) — frontend checks pass (tsc clean, vitest 69/69, build ok); phone check pending
+
+Rules: `.claude/skills/cv-fitness-pipeline/SKILL.md`. No logic changed (same numbers, same message text, same strokes in the same order).
+
+- **Allocations found per frame (30/s) and removed:**
+  - `landmarksToKeypoints`: a new object + 17 new `[x, y, c]` arrays, plus `Object.entries` + iterator, per frame.
+    -> `landmarksToKeypointsInto(out, ...)` writes into one persistent object whose 17 joint arrays are reused (a missing landmark
+    is deleted from it, so "absent" still means absent); precomputed `JOINT_INDEX` / `JOINT_NAME` arrays walked by index.
+  - `worldToJoints`: same -> `worldToJointsInto`.
+  - `bboxFromKeypoints`: `Object.values` + `filter` + 2 `map` + spread into `Math.min/max` + result array -> `bboxFromKeypointsInto(out, kp)`:
+    one pass, scalar min/max, writes a persistent 4-number array, returns false when fewer than 4 confident joints.
+  - Hook callback (`useRemoteSession.ts`): a `{kp, bbox}` object, a `{w, h}` frame object and (when nobody is in view) a `{}` per frame
+    -> one `shown` pose, one `frame` and a frozen shared `NO_JOINTS`, created once per loop start and mutated.
+  - `RemoteView.tsx`: a `{pose, frame}` object per pose in the listener -> one mutated ref object; `getContext("2d")` per frame -> cached.
+  - `drawPose`: a `fitContain` result object, two closures, array destructuring of the bbox and of every bone, `Object.values` + destructuring
+    of every joint -> inlined letterbox maths, indexed loops, `for...in` over the pose. (`fitContain` stays exported.)
+- **Safety of the shared references:** `onDevicePose` documents that `kp`/`world` are the loop's buffers, valid only inside the `pose`
+  callback. Every consumer is synchronous: the canvas listener draws immediately, `keypointMessage` serialises before returning, and the
+  repaint-after-resize keeps a reference to the SAME buffers, which always hold the latest frame (never a stale copy). The old allocating
+  functions remain as thin wrappers (`landmarksToKeypoints`, `worldToJoints`) for tests and one-off use; the loop uses only the `Into` ones.
+- **Not removable here (be honest):** the result object MediaPipe itself returns from `detectForVideo` (its landmark arrays are allocated
+  inside the library in 0.10.14); the one JSON string per SENT frame in `keypointMessage` (plus its small envelope object); the 2 Hz
+  `setLocal` stats. These are the minimum; verify on the phone with Chrome DevTools > Memory > Allocation sampling / Performance heap
+  graph that the sawtooth is now small and the GC bars are rare.
+- Tests: +5 vitest (buffers reused with identical numbers/key order, joint removal and return, world joints, box into a reused array,
+  drawing calls from a reused pose). Verify: `npx tsc --noEmit`, `npm test`, `npm run build`.
+
+### Audit fixes: telemetry re-render storm, dead-tunnel watchdog + banner, safety queue, HUD GPU effects (2026-11-18) — frontend checks pass (tsc clean, vitest 69/69, build ok); phone check pending
 
 - **Re-render storm (`useRemoteSession.ts`).** Server replies (up to 10/s, every frame in server mode) no longer call `setMsg` /
   `setStats`. They are stored in refs (`msgRef`, pump state) and reach React on a 250 ms UI tick (`UI_TICK_MS`), or at once when

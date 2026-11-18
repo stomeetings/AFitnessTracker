@@ -26,12 +26,15 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
   const levelRef = useRef(level);
   levelRef.current = level;
   const dims = useRef({ w: 0, h: 0 });
-  const lastLocal = useRef<{ pose: Pose | null; frame: { w: number; h: number } } | null>(null);
+  // The last pose drawn (a reference to the loop's reused buffers, not a copy): repainted after a resize. One object, mutated.
+  const lastLocal = useRef<{ pose: Pose | null; frame: { w: number; h: number } }>({ pose: null, frame: { w: 0, h: 0 } });
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);          // fetched once, not per frame
 
   /** Draws a pose onto the canvas. Used for 30 poses a second from the on-device model, so it only resizes the canvas when its
-   *  size really changed (resizing clears and reallocates it). */
+   *  size really changed (resizing clears and reallocates it) and allocates nothing itself. */
   const paint = useCallback((pose: Pose | null, frame: { w: number; h: number }) => {
-    const c = canvas.current, ctx = c?.getContext("2d");
+    const c = canvas.current;
+    const ctx = ctxRef.current ?? (c ? (ctxRef.current = c.getContext("2d")) : null);
     const sz = sizeRef.current;
     if (!c || !ctx || !sz.w) return;
     const dpr = window.devicePixelRatio || 1;
@@ -42,7 +45,8 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
   }, []);
 
   useEffect(() => {                                      // every pose (the phone's model or the server's answer) is drawn directly, never via state
-    s.setPoseListener((pose, frame) => { lastLocal.current = { pose, frame }; paint(pose, frame); });
+    const last = lastLocal.current;
+    s.setPoseListener((pose, frame) => { last.pose = pose; last.frame = frame; paint(pose, frame); });   // no object per pose
     return () => s.setPoseListener(null);
   }, [s.setPoseListener, paint]);   // eslint-disable-line react-hooks/exhaustive-deps -- `s` itself changes every render
 
@@ -64,8 +68,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
   }, []);
 
   useEffect(() => {                                      // new poses draw themselves; this repaints the last one after a resize or an alert colour change
-    const last = lastLocal.current;
-    paint(last ? last.pose : null, last ? last.frame : { w: 0, h: 0 });
+    paint(lastLocal.current.pose, lastLocal.current.frame);
   }, [size, level, paint]);
 
   const ratio = s.frame ? `${s.frame.w} / ${s.frame.h}` : "4 / 3";
@@ -143,7 +146,7 @@ export function RemotePanel({ s }: { s: Session }) {
       <div className="mt-2 text-xs text-slate-500">
         {s.status === "live"
           ? s.inference === "device"
-            ? `On-device ${s.local.fps} fps · ${s.local.ms} ms${s.local.delegate ? ` (${s.local.delegate})` : ""}${s.local.status === "loading" ? " · loading the model…" : ""} · only joint positions are sent`
+            ? `On-device ${s.local.fps} fps · ${s.local.ms} ms${s.local.delegate ? ` (${s.local.delegate})` : ""}${s.local.status === "loading" ? " · loading the model…" : ""} · camera ${s.camera.w}×${s.camera.h} · only joint positions are sent`
             : `${s.stats.fps} fps · round trip ${s.stats.rtt} ms · frames ${s.stats.longSide}px${s.engine ? ` · ${engineLabel(s.engine)} ${s.stats.inferMs} ms` : ""}`
           : STATUS_TEXT[s.status]}
       </div>

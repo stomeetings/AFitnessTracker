@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { calibrationNote, worldToJoints } from "./logic";
+import { bboxFromKeypointsInto, landmarksToKeypointsInto, worldToJointsInto } from "./logic";
+import { createTierMonitor, initialTier, tierCeiling, tierConstraints } from "./logic";
 import { LANDMARK_JOINTS, MAX_LOCAL_FPS, ON_DEVICE, bboxFromKeypoints, canRunInference, defaultInference, isMobileDevice, keypointMessage, landmarksToKeypoints } from "./logic";
 import { ACK_TIMEOUT_MS, SAFETY_COMMANDS, connectionLost, urgentChange, MAX_QUALITY, MIN_FRAME_GAP_MS, MIN_QUALITY, SKELETON, canSendFrame, captureSize, drawPose, engineLabel, extractToken, fitContain, isLocalHost, nextEngine, nextQuality, packFrame, reconnectDelay, type Pose } from "./logic";
 
@@ -159,6 +161,116 @@ describe("world landmarks and the calibration note", () => {
 
 describe("engineLabel for the Lite model", () => {
   it("names it", () => expect(engineLabel("mediapipe_lite")).toBe("MediaPipe Lite"));
+});
+
+describe("per-frame helpers reuse their buffers (no allocation in the hot loop)", () => {
+  const frameOf = (shift: number) => Array.from({ length: 33 }, (_, i) => ({ x: 0.2 + i / 100 + shift, y: 0.3 + shift, z: 0.01 * i + shift, visibility: 0.9 }));
+
+  it("fills the same object and the same joint arrays on every frame, with the same numbers as the allocating version", () => {
+    const out = {} as Record<string, [number, number, number]>;
+    const first = landmarksToKeypointsInto(out, frameOf(0), 1280, 720);
+    expect(first).toBe(out);
+    const knee = out.l_knee;
+    const second = landmarksToKeypointsInto(out, frameOf(0.1), 1280, 720);
+    expect(second).toBe(out);
+    expect(out.l_knee).toBe(knee);                                    // the joint's own array is reused, not replaced
+    expect(out).toEqual(landmarksToKeypoints(frameOf(0.1), 1280, 720));
+    expect(Object.keys(out)).toEqual(Object.keys(landmarksToKeypoints(frameOf(0.1), 1280, 720)));   // same order: same message text
+  });
+
+  it("removes a joint whose landmark is gone and brings it back afterwards", () => {
+    const out = {} as Record<string, [number, number, number]>;
+    landmarksToKeypointsInto(out, frameOf(0), 100, 100);
+    landmarksToKeypointsInto(out, frameOf(0).slice(0, 17), 100, 100);   // landmarks 0..16: the nose and the arms only
+    expect(Object.keys(out).sort()).toEqual(["l_elbow", "l_shoulder", "l_wrist", "nose", "r_elbow", "r_shoulder", "r_wrist"]);
+    landmarksToKeypointsInto(out, frameOf(0), 100, 100);
+    expect(Object.keys(out)).toHaveLength(17);
+  });
+
+  it("does the same for the world joints", () => {
+    const out = {} as Record<string, [number, number, number]>;
+    worldToJointsInto(out, frameOf(0));
+    const hip = out.l_hip;
+    worldToJointsInto(out, frameOf(0.05));
+    expect(out.l_hip).toBe(hip);
+    expect(out).toEqual(worldToJoints(frameOf(0.05)));
+  });
+
+  it("writes the box into a reused array, equal to bboxFromKeypoints, and leaves it alone when nobody is there", () => {
+    const kp = landmarksToKeypoints(frameOf(0), 1000, 1000);
+    const box: [number, number, number, number] = [0, 0, 0, 0];
+    expect(bboxFromKeypointsInto(box, kp)).toBe(true);
+    expect(box).toEqual(bboxFromKeypoints(kp));
+    const before = [...box];
+    expect(bboxFromKeypointsInto(box, { a: [1, 2, 0.9], b: [3, 4, 0.9] })).toBe(false);
+    expect(box).toEqual(before);
+  });
+
+  it("draws the same strokes as before from a reused pose (bbox, bones, then joints)", () => {
+    const calls: string[] = [];
+    const ctx = {
+      lineWidth: 0, strokeStyle: "", fillStyle: "",
+      clearRect: () => calls.push("clear"), strokeRect: (...a: number[]) => calls.push(`box ${a.join(",")}`), beginPath: () => {},
+      moveTo: (x: number, y: number) => calls.push(`m ${x},${y}`), lineTo: (x: number, y: number) => calls.push(`l ${x},${y}`),
+      stroke: () => {}, arc: (x: number, y: number) => calls.push(`dot ${x},${y}`), fill: () => {},
+    };
+    const pose = { kp: { l_shoulder: [100, 50, 0.9], r_shoulder: [200, 50, 0.9], l_hip: [100, 150, 0.2] }, bbox: [90, 40, 120, 120] } as Pose;
+    drawPose(ctx, pose, { w: 400, h: 200 }, { w: 800, h: 400 });      // scale 2, no letterbox
+    expect(calls).toEqual(["clear", "box 180,80,240,240", "m 200,100", "l 400,100", "dot 200,100", "dot 400,100"]);   // the weak hip: no bone, no dot
+  });
+});
+
+describe("adaptive camera resolution", () => {
+  it("starts a computer at 720p and a phone at 640x480, lower for a weak phone, and never against an unknown value", () => {
+    expect(initialTier(false, 8, 8)).toBe("high");
+    expect(initialTier(true, 8, 6)).toBe("mid");                     // a Galaxy A52 class phone
+    expect(initialTier(true, 8, undefined)).toBe("mid");             // iOS reports no memory
+    expect(initialTier(true, undefined, undefined)).toBe("mid");
+    expect(initialTier(true, 8, 2)).toBe("low");
+    expect(initialTier(true, 4, 4)).toBe("low");
+    expect(tierCeiling(true)).toBe("mid");
+    expect(tierCeiling(false)).toBe("high");
+  });
+
+  it("asks the camera for the tier's size as an ideal, never exact", () => {
+    expect(tierConstraints("mid")).toEqual({ width: { ideal: 640 }, height: { ideal: 480 } });
+    expect(tierConstraints("high")).toEqual({ width: { ideal: 1280 }, height: { ideal: 720 } });
+    expect(tierConstraints("low")).toEqual({ width: { ideal: 480 }, height: { ideal: 360 } });
+  });
+
+  const run = (m: ReturnType<typeof createTierMonitor>, n: number, fps: number, ms: number) => {
+    const out: (string | null)[] = [];
+    for (let i = 0; i < n; i++) out.push(m.sample(fps, ms));
+    return out.filter((t) => t !== null);
+  };
+
+  it("steps down after 3 s over budget, one tier at a time, and stops at the lowest", () => {
+    const m = createTierMonitor("high", "high");
+    expect(run(m, 4, 10, 60)).toEqual([]);                          // the camera is still settling
+    expect(run(m, 6, 10, 60)).toEqual(["mid"]);
+    expect(run(m, 4 + 6, 10, 60)).toEqual(["low"]);                 // settle again, then another 3 s
+    expect(run(m, 100, 10, 60)).toEqual([]);                        // nothing lower to go to
+    expect(m.tier).toBe("low");
+  });
+
+  it("ignores a short spike and a slow camera with a cheap model", () => {
+    const m = createTierMonitor("mid", "mid");
+    run(m, 4, 30, 10);
+    expect(run(m, 5, 10, 60)).toEqual([]);                          // 2.5 s: not sustained
+    expect(run(m, 1, 30, 10)).toEqual([]);                          // recovered: the counter starts over
+    expect(run(m, 5, 10, 60)).toEqual([]);
+    expect(run(createTierMonitor("mid", "mid"), 100, 12, 8)).toEqual([]);   // 12 fps from a dim room, but the model takes 8 ms: not the phone's fault
+  });
+
+  it("climbs back after 20 s of headroom, but never above its ceiling", () => {
+    const m = createTierMonitor("low", "mid");
+    run(m, 4, 30, 10);
+    expect(run(m, 40, 30, 10)).toEqual(["mid"]);
+    expect(run(m, 4 + 200, 30, 10)).toEqual([]);                    // a phone does not go back to 720p
+    const desk = createTierMonitor("mid", "high");
+    run(desk, 4, 30, 10);
+    expect(run(desk, 40, 30, 10)).toEqual(["high"]);
+  });
 });
 
 describe("connectionLost (the dead-tunnel watchdog)", () => {

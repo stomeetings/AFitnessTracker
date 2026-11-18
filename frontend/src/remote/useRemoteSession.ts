@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Telemetry } from "../useTelemetry";
 import {
-  MAX_QUALITY, ON_DEVICE, SAFETY_COMMANDS, SAFETY_MAX_AGE_MS, SAFETY_QUEUE_MAX, UI_TICK_MS, bboxFromKeypoints, canSendFrame, captureSize,
-  connectionLost, defaultInference, extractToken, isMobileDevice, keypointMessage, nextQuality, packFrame, reconnectDelay, urgentChange,
-  type InferenceMode, type Pose, type Quality,
+  MAX_QUALITY, ON_DEVICE, SAFETY_COMMANDS, SAFETY_MAX_AGE_MS, SAFETY_QUEUE_MAX, UI_TICK_MS, bboxFromKeypointsInto, canSendFrame, captureSize,
+  TIER_SIZE, connectionLost, createTierMonitor, defaultInference, extractToken, initialTier, isMobileDevice, keypointMessage, nextQuality,
+  packFrame, reconnectDelay, tierCeiling, tierConstraints, urgentChange,
+  type CameraTier, type InferenceMode, type Keypoints, type Pose, type Quality,
 } from "./logic";
+
+const NO_JOINTS: Keypoints = Object.freeze({}) as Keypoints;     // "nobody in view": one shared empty set, never written to
 import { createLandmarker, runLocalLoop, type LoadedLandmarker } from "./onDevicePose";
 import { MIC_CONSTRAINTS, micErrorText } from "./voice";
 import { useVoiceInput, type VoiceReply } from "./useVoiceInput";
@@ -55,13 +58,14 @@ const HEALTH_HINT = "Remote sessions are switched off on the server. Start the b
 /** The camera, and (when asked) the microphone in the same permission prompt, split into two streams so switching the
  *  camera never touches the microphone. A refused or missing microphone does not stop the camera: it is reported in
  *  `micError` and the session runs without voice. Must run from a tap (browsers ask for permission only then). */
-async function openMedia(facing: Facing, audio: boolean, exact = false): Promise<{ stream: MediaStream; mic: MediaStream | null; micError: string | null }> {
+async function openMedia(facing: Facing, audio: boolean, exact = false, tier: CameraTier = "mid"): Promise<{ stream: MediaStream; mic: MediaStream | null; micError: string | null }> {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error(window.isSecureContext ? "This browser has no camera API." : "The camera needs HTTPS (or localhost). Open this page over https://.");
   }
   // `ideal` first: a laptop with one camera still starts when "rear" is asked for. `exact` is the retry for phones that
   // ignore `ideal` and hand back the same camera.
-  const video = { facingMode: exact ? { exact: facing } : { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } };
+  // The size comes from the camera tier (720p on a computer, 640x480 on a phone, lower when the phone struggles), not a fixed 1280x720.
+  const video = { facingMode: exact ? { exact: facing } : { ideal: facing }, ...tierConstraints(tier) };
   if (audio) {
     try {
       const all = await navigator.mediaDevices.getUserMedia({ video, audio: MIC_CONSTRAINTS });
@@ -103,6 +107,12 @@ export function useRemoteSession() {
   const [inference, setInferenceState] = useState<InferenceMode>(loadInference);
   const inferenceRef = useRef(inference);
   const [local, setLocal] = useState({ fps: 0, ms: 0, status: "idle" as "idle" | "loading" | "running", delegate: "" });
+  // Adaptive camera resolution: the tier the camera runs at, and the monitor that steps it down / up from the model's measured time.
+  const mobile = useRef(isMobileDevice(navigator.userAgent, navigator.maxTouchPoints ?? 0)).current;
+  const tierRef = useRef<CameraTier>(initialTier(mobile, navigator.hardwareConcurrency,
+    (navigator as Navigator & { deviceMemory?: number }).deviceMemory));
+  const [cameraTier, setCameraTier] = useState<CameraTier>(tierRef.current);
+  const monitorRef = useRef<ReturnType<typeof createTierMonitor> | null>(null);
   const landmarkerRef = useRef<LoadedLandmarker | null>(null);       // loaded once, kept across stops and restarts
   const loopRef = useRef<{ stop: () => void } | null>(null);
   const kpSeq = useRef(0);
@@ -190,6 +200,17 @@ export function useRemoteSession() {
 
   const stopLocal = () => { loopRef.current?.stop(); loopRef.current = null; };
 
+  /** Changes the size of the RUNNING camera track (no reopening: reopening a phone camera is what failed on camera switches). The
+   *  frames carry their own width and height, the overlay maps every pose by them and the preview letterboxes (object-contain), so
+   *  nothing else needs to know. If the camera refuses, it keeps its current size. */
+  const applyTier = useCallback(async (tier: CameraTier) => {
+    tierRef.current = tier;
+    setCameraTier(tier);
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    try { await track.applyConstraints(tierConstraints(tier)); } catch { /* keeps the current size */ }
+  }, []);
+
   /** On-device inference: load the model (once), then detect on every new camera frame and send the joints. If it cannot run
    *  (no WebAssembly, offline and not cached, model missing, the model throws), the server takes over with frames. */
   const startLocal = useCallback(async () => {
@@ -214,20 +235,30 @@ export function useRemoteSession() {
     }
     const { landmarker, delegate } = landmarkerRef.current;
     setLocal((l) => ({ ...l, status: "running", delegate }));
+    // Created once per loop, overwritten in place by every frame (the per-frame path must not allocate: see the cv-fitness-pipeline
+    // skill). The listener draws from them synchronously and keeps no copy; the message is serialised before the callback returns.
+    const bbox: [number, number, number, number] = [0, 0, 0, 0];
+    const shown: Pose = { kp: NO_JOINTS, bbox };
+    const frame = { w: 0, h: 0 };
     loopRef.current = runLocalLoop(() => videoRef.current, landmarker, {
       pose: (kp, w, h, tMs, world) => {
-        const box = kp ? bboxFromKeypoints(kp) : null;
-        poseListener.current?.(kp && box ? { kp, bbox: box } : null, { w, h });      // the skeleton, with no network in between
+        frame.w = w; frame.h = h;
+        if (kp && bboxFromKeypointsInto(bbox, kp)) { shown.kp = kp; poseListener.current?.(shown, frame); }   // the skeleton, with no network in between
+        else poseListener.current?.(null, frame);
         const sock = ws.current;
         if (sock && sock.readyState === WebSocket.OPEN && opened.current && sock.bufferedAmount < 65536) {   // never build a backlog
-          sock.send(keypointMessage(++kpSeq.current, tMs, w, h, kp ?? {}, kp ? world : undefined));
+          sock.send(keypointMessage(++kpSeq.current, tMs, w, h, kp ?? NO_JOINTS, kp ? world : undefined));
           lastSent.current = performance.now();
         }
       },
-      stats: (fps, ms) => setLocal((l) => ({ ...l, fps, ms })),
+      stats: (fps, ms) => {
+        setLocal((l) => ({ ...l, fps, ms }));
+        const next = monitorRef.current?.sample(fps, ms);            // over budget for 3 s: a smaller camera image; 20 s of headroom: back up
+        if (next) void applyTier(next);
+      },
       failed: fallBack,
     });
-  }, [startPump]);
+  }, [startPump, applyTier]);
 
   /** (Re)start whichever source of poses is selected: this device's model, or JPEG frames for the server's. */
   const startActive = useCallback(() => {
@@ -376,7 +407,8 @@ export function useRemoteSession() {
         return;
       }
       setNeedsToken(false);
-      const media = await openMedia(facingRef.current, true);
+      monitorRef.current = createTierMonitor(tierRef.current, tierCeiling(mobile));    // a tier an earlier session settled on carries over
+      const media = await openMedia(facingRef.current, true, false, tierRef.current);
       if (!want.current) {                                         // stopped while the permission prompt was open
         [media.stream, media.mic].forEach((m) => m?.getTracks().forEach((t) => t.stop()));
         return;
@@ -408,7 +440,7 @@ export function useRemoteSession() {
     try {
       for (const [facingTry, exact] of [[next, false], [next, true], [previous, false]] as const) {   // other camera, strictly, then back
         try {
-          const { stream: s } = await openMedia(facingTry, false, exact);   // the microphone keeps running
+          const { stream: s } = await openMedia(facingTry, false, exact, tierRef.current);   // the microphone keeps running
           if (!want.current) { s.getTracks().forEach((t) => t.stop()); return; }    // stopped meanwhile
           facingRef.current = facingTry;
           setFacing(facingTry);
@@ -500,6 +532,7 @@ export function useRemoteSession() {
     inference, local, models, model, modelMs, modelWanted, setModel, setPoseListener,
     voice,
     frame: msg?.frame ?? null,
+    camera: { tier: cameraTier, ...TIER_SIZE[cameraTier] },       // what the camera was last asked for (the browser picks its nearest mode)
     start, stop, switchCamera, send,
   };
 }
