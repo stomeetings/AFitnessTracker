@@ -1016,6 +1016,22 @@ only with sign-off; Capacitor native only when background fall monitoring is req
 - `App.tsx`: the Start button and the voice command "start_session" show a non-blocking overlay (`pointer-events-none`, no blur) and speak each step; the Exercise Guide ("preview") opening/closing says "Displaying preview" / "Closing preview" (skipped while a countdown is speaking).
 - Nothing touches the frame loop, the pose code or the server. Reps still start counting immediately on Start (the overlay is a cue only). Phone check pending; tsc/vitest/build not yet run.
 
+### Canvas sized to the video picture, not the outer box (2026-11-18)
+
+- `RemoteView.tsx`: a "stage" rectangle = `fitContain(frame ratio, outer box)` (centred, rounded px) now wraps the `<video>` and the `<canvas>`; both fill the stage only. The canvas backing store, the `paint()` mapping and `drawPose`'s box all use the stage size, so the canvas is exactly the rendered picture (previously it was the whole outer box and relied on `drawPose`'s letterbox maths to match the video's `object-contain` bars, which could drift when the ratio of `s.frame` and the real frame differed, e.g. during a camera-tier change). The mirror transform sits on the stage. The outer box (aspect-ratio / `78dvh` / full screen) is unchanged and is what the ResizeObserver measures.
+- Mathematically the same picture when everything agrees; the difference is robustness. Frame loop untouched (paint still allocation-free: `stage` is one small object per render, not per pose). tsc/vitest/build and a phone check (20:9 phone, portrait + fullscreen) pending.
+
+### Session-end cue: speak before tearing down (2026-11-18)
+
+- `speak()` / `cue()` in `cues.ts` now return a Promise that resolves when the phrase is finished (native: when `TextToSpeech.speak` resolves; browser: utterance `onend`/`onerror`; also on failure or no speech support; it never rejects). New `cueThen(name, maxMs)` races it against a timeout.
+- `App.tsx` `endSession()` awaits `cueThen("end", 4000)` and only then calls `remote.stop()`, with an `ending` ref so a second tap/voice command while it speaks does nothing. Cost: the camera runs about 2-3 s longer after Stop/"stop session" (the Paused card and countdown are cleared at once). Other callers ignore the promise, so their behaviour is unchanged.
+- Cause not proven: the previous code spoke and stopped in the same tick; I could not reproduce it without a device. If it is still silent, the speech itself is not playing (TTS engine / volume), which the console warning `[cues] ...` would show. tsc/vitest/build and phone check pending.
+
+### Session-end cue and tall-screen layout (2026-11-18)
+
+- `cues.ts`: new phrase `end` = "OK, closing session. Thank you!". `App.tsx` `endSession()` (speaks it, clears Paused/countdown, then `remote.stop()`) is used by the sidebar Stop button (`RemotePanel` got an `onStop` prop) and the voice "stop session". It is not called when the session ends by itself (camera interrupted, switch to Server camera), so nothing speaks unprompted.
+- Layout: the camera video was ALREADY `object-contain` (never stretched, letterboxed on 20:9 / 19.5:9 screens) and the skeleton maths (`drawPose` / fitContain) assumes exactly that, so `object-cover` was NOT applied: it would crop the video while the overlay stayed uncropped (misaligned skeleton) and cut off a patient at the edges. Only change: the preview's max height uses `78dvh` instead of `78vh` (the mobile browser bar no longer makes it taller than the visible screen). A screenshot of the distortion is needed to find anything else.
+
 ### Tunnel over HTTP/2 and skeleton flicker (2026-11-18)
 
 - Tunnel: no script launches cloudflared, so the command is changed where it is documented (`NATIVE_DEMO_PLAN.md`, `docs/cloud_mobile_blueprint.md`): `cloudflared tunnel --url http://localhost:8000 --protocol http2` (TCP instead of the default QUIC/UDP). The tunnel must be restarted by hand with it; the URL changes, so the APK needs a rebuild.

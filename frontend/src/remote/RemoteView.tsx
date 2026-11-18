@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, Loader2, Play, SwitchCamera, Square } from "lucide-react";
 import { Hud } from "./Hud";
-import { calibrationNote, drawPose, engineLabel, nextEngine, type AlertLevel, type Pose } from "./logic";
+import { calibrationNote, drawPose, engineLabel, fitContain, nextEngine, type AlertLevel, type Pose } from "./logic";
 import type { Facing, RemoteSession as Session, RemoteStatus } from "./useRemoteSession";
 import { MIC_TEXT, VOICE_HELP, VoiceChip } from "./VoiceChip";
 
@@ -21,8 +21,13 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
   const t = s.telemetry;
   const running = s.stream !== null;
   const otherModel = s.model ? nextEngine(s.model, s.models) : null;         // what a tap on the model badge switches to
-  const sizeRef = useRef(size);
-  sizeRef.current = size;
+  // The "stage": the exact rectangle the video image occupies inside the outer box (the camera's aspect ratio, centred). The video
+  // AND the canvas fill the stage and nothing else, so the canvas is never wider/taller than the picture it annotates.
+  const fw = s.frame?.w || 4, fh = s.frame?.h || 3;
+  const fit = size.w && size.h ? fitContain(fw, fh, size.w, size.h) : { x: 0, y: 0, w: 0, h: 0 };
+  const stage = { x: Math.round(fit.x), y: Math.round(fit.y), w: Math.round(fit.w), h: Math.round(fit.h) };
+  const sizeRef = useRef(stage);
+  sizeRef.current = stage;                                // what paint() maps onto: the stage, not the outer box
   const levelRef = useRef(level);
   levelRef.current = level;
   const dims = useRef({ w: 0, h: 0 });
@@ -77,13 +82,13 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
 
   useEffect(() => {                                      // new poses draw themselves; this repaints the last one after a resize or an alert colour change
     paint(lastLocal.current.pose, lastLocal.current.frame);
-  }, [size, level, paint]);
+  }, [stage.w, stage.h, level, paint]);
 
   const ratio = s.frame ? `${s.frame.w} / ${s.frame.h}` : "4 / 3";
   return (
     <div ref={box} className={`relative w-full overflow-hidden bg-black ${full ? "h-full" : ""}`}
-      style={full ? undefined : { aspectRatio: ratio, maxHeight: "78vh" }}>
-      <div className="absolute inset-0" style={{ transform: s.facing === "user" ? "scaleX(-1)" : undefined }}>
+      style={full ? undefined : { aspectRatio: ratio, maxHeight: "78dvh" }}>
+      <div className="absolute" style={{ left: stage.x, top: stage.y, width: stage.w, height: stage.h, transform: s.facing === "user" ? "scaleX(-1)" : undefined }}>
         {/* opacity, not visibility: a hidden video can be paused by the browser and stay black when shown again */}
         <video ref={s.videoRef} playsInline muted autoPlay className={`h-full w-full object-contain ${hidden ? "opacity-0" : ""}`} />
         <canvas ref={canvas} className="pointer-events-none absolute inset-0 block h-full w-full" />
@@ -135,7 +140,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
 }
 
 /** Sidebar card for the browser camera: front/rear switch, stop, and the link's measured speed. */
-export function RemotePanel({ s }: { s: Session }) {
+export function RemotePanel({ s, onStop }: { s: Session; onStop: () => void }) {
   const running = s.stream !== null;
   const facing: Facing = s.facing;
   return (
@@ -146,7 +151,7 @@ export function RemotePanel({ s }: { s: Session }) {
           className="flex min-h-11 items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm hover:bg-slate-700 disabled:opacity-50">
           <SwitchCamera size={16} /> {facing === "user" ? "Use rear" : "Use front"}
         </button>
-        <button onClick={s.stop} disabled={!running}
+        <button onClick={onStop} disabled={!running}
           className="flex min-h-11 items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm hover:bg-slate-700 disabled:opacity-50">
           <Square size={14} /> Stop
         </button>

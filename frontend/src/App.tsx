@@ -10,7 +10,7 @@ import { Hud } from "./remote/Hud";
 import { useFullscreen } from "./remote/useFullscreen";
 import { VOICE_HELP, VoiceChip } from "./remote/VoiceChip";
 import { intentEffects } from "./remote/voice";
-import { cue, runCountdown, unlockSpeech } from "./cues";
+import { cue, cueThen, runCountdown, unlockSpeech } from "./cues";
 import { preloadLandmarker } from "./remote/onDevicePose";
 import { useTelemetry, type Limb } from "./useTelemetry";
 
@@ -173,6 +173,17 @@ export default function App() {
   // (Not in Server camera mode: that visitor never needs the ~10 MB of WASM and model.)
   useEffect(() => { if (device) preloadLandmarker(); }, [device]);
   const startSession = () => { setPaused(false); countdown(); setGuideOpen(false); if (device) remote.send("start_session"); else void post("/api/session/start"); };
+  // The user ended the phone session (Stop button or "stop session"): say goodbye, then stop. Not called when the session ends
+  // by itself (camera interrupted, switching to Server camera mode), so that never talks unprompted.
+  // The phrase is awaited (at most 4 s) BEFORE the stop, so the teardown cannot cut it off; a second press while it speaks
+  // does nothing. The Paused card goes at once so the screen reacts immediately.
+  const ending = useRef(false);
+  const endSession = () => {
+    if (ending.current) return;
+    ending.current = true;
+    stopCount.current?.(); setPaused(false);
+    void cueThen("end", 4000).finally(() => { ending.current = false; remote.stop(); });
+  };
   const pauseSession = () => { if (device) remote.send("stop_session"); else void post("/api/session/stop"); };
   const fs = useFullscreen();               // the video wrapper goes full screen with its HUD; modal dialogs still sit on top
 
@@ -215,7 +226,7 @@ export default function App() {
       // the Exercise Guide: the same state the Info button sets. Only "show/hide preview" announce it; a start, resume or stop
       // that closes the guide does so silently (the countdown or "Paused" is speaking).
       if (fx.showGuide !== undefined) (heardIntent === "show_preview" || heardIntent === "hide_preview" ? showGuide : setGuideOpen)(fx.showGuide);
-      if (fx.stopDeviceSession) remote.stop();
+      if (fx.stopDeviceSession) endSession();
     }, 700);
   }, [heardSeq]);   // eslint-disable-line react-hooks/exhaustive-deps -- one run per spoken sentence
   useEffect(() => () => window.clearTimeout(commandTimer.current), []);
@@ -337,7 +348,7 @@ export default function App() {
         </section>
 
         <aside className="flex flex-col gap-4">
-          {device ? <RemotePanel s={remote} /> : <CameraPicker active={t?.camera_index} backend={t?.camera_backend} error={t?.camera_error} />}
+          {device ? <RemotePanel s={remote} onStop={endSession} /> : <CameraPicker active={t?.camera_index} backend={t?.camera_backend} error={t?.camera_error} />}
           {!device && localVoice.mic !== "off" && (
             <div className={`text-xs ${localVoice.mic === "blocked" || localVoice.mic === "unavailable" ? "text-amber-400" : "text-slate-500"}`}>
               {localVoice.micError ?? ""}
