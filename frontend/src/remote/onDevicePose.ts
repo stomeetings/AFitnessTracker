@@ -1,4 +1,5 @@
 import type { PoseLandmarker } from "@mediapipe/tasks-vision";
+import { isBundled } from "../net";
 import { canRunInference, landmarksToKeypointsInto, worldToJointsInto, type Keypoints, type World } from "./logic";
 
 /** MediaPipe Pose Landmarker running in this browser (WebAssembly, on the GPU where the phone allows it): the pose is computed
@@ -7,7 +8,8 @@ import { canRunInference, landmarksToKeypointsInto, worldToJointsInto, type Keyp
 
 // Must be the same version as the installed package (package.json pins it): the JavaScript and the WebAssembly belong together.
 export const TASKS_VISION_VERSION = "0.10.14";
-const WASM_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VISION_VERSION}/wasm`;
+// The offline (bundled) APK ships the WASM inside itself (scripts/copy-assets.mjs); every other build uses the CDN as before.
+const WASM_BASE = isBundled() ? "/mediapipe/wasm" : `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VISION_VERSION}/wasm`;
 /** Tried in order: this server (loaded once, then cached by the browser) and then Google's host as a fallback. */
 export const MODEL_URLS = [
   "/models/pose_landmarker_lite.task",

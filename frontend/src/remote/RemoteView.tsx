@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, Loader2, Play, SwitchCamera, Square } from "lucide-react";
 import { Hud } from "./Hud";
+import { syncText, useSyncStatus } from "../sync";
 import { calibrationNote, drawPose, engineLabel, fitContain, nextEngine, type AlertLevel, type Pose } from "./logic";
 import type { Facing, RemoteSession as Session, RemoteStatus } from "./useRemoteSession";
 import { MIC_TEXT, VOICE_HELP, VoiceChip } from "./VoiceChip";
@@ -20,6 +21,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
   const [pin, setPin] = useState("");
   const t = s.telemetry;
   const running = s.stream !== null;
+  const offline = running && s.analyticsLocal && s.linkUp === false;       // counting still works here; the server (and so the caregiver) is out of reach
   const otherModel = s.model ? nextEngine(s.model, s.models) : null;         // what a tap on the model badge switches to
   // The "stage": the exact rectangle the video image occupies inside the outer box (the camera's aspect ratio, centred). The video
   // AND the canvas fill the stage and nothing else, so the canvas is never wider/taller than the picture it annotates.
@@ -98,7 +100,8 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
       <Hud
         status={`${s.status === "live" ? (t?.pose_visible ? `LIVE · ${t.posture ?? "pose"}` : "LIVE · no pose") : STATUS_TEXT[s.status]}${hidden && running ? " · privacy" : ""}`}
         statusTone={s.status === "live" ? "ok" : s.status === "error" ? "bad" : "warn"}
-        lost={running && s.status === "reconnecting"}
+        lost={running && !s.analyticsLocal && s.status === "reconnecting"}
+        offline={offline}
         counting={s.status === "live" ? t?.counting : undefined}
         reps={s.status === "live" ? t?.reps : undefined}
         note={s.status === "live" ? calibrationNote(t?.reps) : undefined}
@@ -110,7 +113,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
         onFlip={running ? () => void s.switchCamera() : undefined}
         flipLabel={s.facing === "user" ? "Use rear" : "Use front"}
         full={full} onToggleFull={onToggleFull} onStart={onStart} onPause={onPause}
-        extra={running ? <VoiceChip mic={s.voice.mic} error={s.voice.micError} heard={s.voice.heard.text} intent={s.voice.heard.intent} /> : null}
+        extra={running ? <VoiceChip mic={s.voice.mic} error={s.voice.micError} heard={s.voice.heard.text} intent={s.voice.heard.intent} offline={offline} /> : null}
       />
 
       {!running && (
@@ -142,6 +145,7 @@ export function RemoteView({ s, hidden, level, full, onToggleFull, onStart, onPa
 /** Sidebar card for the browser camera: front/rear switch, stop, and the link's measured speed. */
 export function RemotePanel({ s, onStop }: { s: Session; onStop: () => void }) {
   const running = s.stream !== null;
+  const sync = useSyncStatus();                  // re-renders this card only when the queue's status changes
   const facing: Facing = s.facing;
   return (
     <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
@@ -155,6 +159,18 @@ export function RemotePanel({ s, onStop }: { s: Session; onStop: () => void }) {
           className="flex min-h-11 items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 text-sm hover:bg-slate-700 disabled:opacity-50">
           <Square size={14} /> Stop
         </button>
+      </div>
+      <div role="group" aria-label="Where the reps and falls are worked out" className="mt-2 flex items-center gap-2 text-xs text-slate-400">
+        Analytics
+        {([["local", "This phone"], ["server", "Server"]] as const).map(([m, label]) => (
+          <button key={m} aria-pressed={s.engineMode === m} disabled={running}
+            title={m === "local" ? "Reps and fall detection run on this phone: they keep working with no connection" : "Reps and fall detection run on the server"}
+            onClick={() => s.setEngineMode(m)}
+            className={`rounded-full px-3 py-1 disabled:opacity-60 ${s.engineMode === m ? "bg-emerald-500 text-slate-950" : "border border-slate-700 text-slate-300 hover:bg-slate-800"}`}>{label}</button>
+        ))}
+      </div>
+      <div role="status" className={`mt-2 text-xs ${sync.pending === 0 ? "text-slate-500" : sync.state === "auth" || sync.state === "error" ? "text-amber-300" : "text-slate-300"}`}>
+        {syncText(sync)}
       </div>
       <div className="mt-2 text-xs text-slate-500">
         {s.status === "live"

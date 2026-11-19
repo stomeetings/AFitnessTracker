@@ -5,6 +5,7 @@ tracking changes. Quick tunnels get a new address every run, so run this again w
 
     backend/.venv/Scripts/python scripts/build_and_serve_apk.py                       # asks for the URL
     backend/.venv/Scripts/python scripts/build_and_serve_apk.py --url https://x.trycloudflare.com
+    backend/.venv/Scripts/python scripts/build_and_serve_apk.py --bundled --url https://x.trycloudflare.com   # offline-first APK
     backend/.venv/Scripts/python scripts/build_and_serve_apk.py --serve-only          # last APK, just the QR code
     backend/.venv/Scripts/python scripts/build_and_serve_apk.py --adb                 # install over USB instead
 
@@ -73,17 +74,33 @@ def tunnel_url(arg: str | None) -> str:
     return url
 
 
-def write_config(url: str) -> None:
+def write_config(url: str, bundled: bool = False) -> None:
     config = {
         "appId": "com.aifitness.tracker",
         "appName": "AI Fitness Tracker",
         "webDir": "dist",
-        # The WebView opens the tunnel instead of the bundled files. cleartext only matters for an http:// URL.
-        "server": {"url": url, "cleartext": url.startswith("http://")},
+        # Default: the WebView opens the tunnel instead of the bundled files (cleartext only matters for an http:// URL).
+        # Bundled (offline-first): no server.url, the page comes from the APK (https://localhost) and `url` is only the API
+        # address built into the app (VITE_API_BASE).
+        "server": {"androidScheme": "https"} if bundled else {"url": url, "cleartext": url.startswith("http://")},
         "android": {"allowMixedContent": False},
     }
     CONFIG.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {CONFIG.relative_to(ROOT)} -> {url}")
+    print(f"wrote {CONFIG.relative_to(ROOT)} -> {'bundled app, API ' if bundled else ''}{url}")
+
+
+def build_bundled_web(api_url: str) -> None:
+    """The offline build: the MediaPipe WASM and the Lite model are copied into the page, VITE_BUNDLED=1 makes it load them from
+    there, and VITE_API_BASE points the API/WebSocket at the backend (a tunnel or LAN address). The copies are removed afterwards."""
+    env = {"VITE_BUNDLED": "1", "VITE_API_BASE": api_url}
+    run("node scripts/copy-assets.mjs", FRONTEND)
+    try:
+        os.environ.update(env)
+        run("npm run build", FRONTEND)
+    finally:
+        for key in env:
+            os.environ.pop(key, None)
+        run("node scripts/copy-assets.mjs --clean", FRONTEND)
 
 
 def patch_manifest() -> None:
@@ -106,7 +123,7 @@ def patch_wrapper() -> None:
         print("gradle-wrapper.properties: -bin download, 120 s timeout")
 
 
-def build() -> None:
+def build(bundled_url: str | None = None) -> None:
     for var in ("JAVA_HOME", "ANDROID_HOME"):
         if not os.environ.get(var):
             sys.exit(f"{var} is not set: see NATIVE_DEMO_PLAN.md, step 1 (open a NEW terminal after setting it)")
@@ -114,7 +131,9 @@ def build() -> None:
         # Trust what Windows trusts (still full certificate checks). The wrapper that downloads Gradle reads only GRADLE_OPTS, not
         # gradle.properties; the build JVM inherits it too.
         os.environ["GRADLE_OPTS"] = (os.environ.get("GRADLE_OPTS", "") + " -Djavax.net.ssl.trustStoreType=Windows-ROOT").strip()
-    if not (FRONTEND / "dist" / "index.html").is_file():
+    if bundled_url:
+        build_bundled_web(bundled_url)                       # always rebuilt: the files inside the APK are what the phone runs
+    elif not (FRONTEND / "dist" / "index.html").is_file():
         run("npm run build", FRONTEND)                       # Capacitor insists on webDir existing, even with server.url
     if not ANDROID.is_dir():
         run("npx cap add android", FRONTEND)
@@ -172,11 +191,14 @@ def main() -> None:
     ap.add_argument("--adb", action="store_true", help="install over USB (adb install -r) instead of serving a QR code")
     ap.add_argument("--ip", default=None, help="LAN address to put in the QR code (default: detected)")
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--bundled", action="store_true",
+                    help="offline-first app: the page and the pose model are inside the APK; --url is only the backend address")
     args = ap.parse_args()
 
     if not args.serve_only:
-        write_config(tunnel_url(args.url))
-        build()
+        url = tunnel_url(args.url)
+        write_config(url, args.bundled)
+        build(url if args.bundled else None)
     if not APK.is_file():
         sys.exit(f"no APK at {APK.relative_to(ROOT)}: run without --serve-only first")
     if args.adb:

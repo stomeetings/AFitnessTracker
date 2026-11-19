@@ -75,6 +75,7 @@ class InferenceService:
         self._shared: PoseEngine | None = None      # the one instance of a stateless engine
         self._spare: PoseEngine | None = None       # a freshly loaded stateful engine, waiting for its first session
         self._per_session: dict[str, PoseEngine] = {}
+        self._refilling = False                     # a spare is being loaded on a side thread
         self._seq = 0
         self._thread: threading.Thread | None = None
 
@@ -221,9 +222,35 @@ class InferenceService:
             return self._shared
         engine = self._per_session.get(session.id)
         if engine is None:
-            engine, self._spare = self._spare or self._create(self._engine_name), None
+            with self._lock:
+                engine, self._spare = self._spare, None
+            engine = engine or self._create(self._engine_name)      # a spare is ready except right after another session took it
             self._per_session[session.id] = engine
+            self._refill_spare()                                    # so the NEXT session (a reconnect) does not load a model while waiting
         return engine
+
+    def _refill_spare(self) -> None:
+        """Load the next stateful engine on a side thread: loading a MediaPipe model takes seconds, and doing it inside the inference
+        loop (or after a reconnect, when the client is already waiting for its first answer) stalls every session."""
+        if self._shared is not None or self._spare is not None or self._refilling or not self._loaded or self._stop.is_set():
+            return
+        self._refilling, name = True, self._engine_name
+
+        def work() -> None:
+            engine = None
+            try:
+                engine = self._create(name)
+                with self._lock:
+                    if self._engine_name == name and self._spare is None and self._shared is None and not self._stop.is_set():
+                        self._spare, engine = engine, None
+            except Exception:  # noqa: BLE001
+                log.exception("preloading a spare %s engine failed", name)
+            finally:
+                if engine is not None:
+                    self._close(engine)
+                self._refilling = False
+
+        threading.Thread(target=work, daemon=True, name="engine-spare").start()
 
     def _infer(self, batch: list[_Slot]) -> tuple[list[PoseResult | None], list[str | None]]:
         poses: list[PoseResult | None] = [None] * len(batch)

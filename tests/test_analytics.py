@@ -1781,6 +1781,182 @@ def test_session_commands_are_understood_loosely_but_never_by_accident():
         assert c(text) is None, text
 
 
+def test_the_phone_engine_reads_the_same_exercise_table_as_the_server():
+    """frontend/src/shared/exercises.json is generated from rep_counter.EXERCISES (scripts/export_exercises.py); the on-device
+    engine and the picker import it, so a table change that is not exported fails here."""
+    from app.pipeline.rep_counter import EXERCISES
+    path = Path(__file__).resolve().parents[1] / "frontend" / "src" / "shared" / "exercises.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data == EXERCISES and list(data) == list(EXERCISES), "run: backend/.venv/Scripts/python scripts/export_exercises.py"
+
+
+def test_golden_traces_replay_the_same_way_twice_and_exercise_what_they_claim():
+    """The generator behind tests/golden (scripts/make_golden.py) is deterministic, and its traces really count reps, calibrate,
+    fall, alert and step, so the TypeScript parity test compares something."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import make_golden
+    traces = {t["name"]: t for t in make_golden.build()}
+    assert len(traces) >= 6
+    done = {name: make_golden.replay(t) for name, t in traces.items()}
+    assert done["elbow_curl_3d"] == make_golden.replay(traces["elbow_curl_3d"])
+    assert done["elbow_curl_3d"][-1]["reps"]["L"][0] >= 4 and done["elbow_curl_3d"][-1]["reps"]["R"][0] >= 4
+    seated = done["knee_seated_calibrated"]
+    assert any(f["reps"]["L"][2] and f["reps"]["R"][2] for f in seated) and seated[-1]["reps"]["L"][0] >= 3
+    fall = done["fall_and_alert"]
+    assert any(f["fall"][0] == "CONFIRMED" for f in fall) and any(f["alert"][0] == "ALERTED" for f in fall) and fall[-1]["fall"][0] == "NORMAL"
+    test_fall = done["test_fall_and_lost_pose"]
+    assert any(f["alert"][0] == "COUNTDOWN" for f in test_fall) and any(f["alert"][0] == "ALERTED" for f in test_fall)
+    assert done["walking_steps"][-1]["steps"] >= 3
+
+
+# ---- Phase 4: the phones' upload and the history (app/storage.py, app/sync_api.py) --------------------------------------------
+
+def _sess(i, reps=3, falls=0, **over):
+    s = {"id": f"sess-{i:04d}-abcdef", "exercise": "Elbow Curl", "startedAt": 1_700_000_000_000 + i * 1000, "endedAt": 1_700_000_060_000 + i * 1000,
+         "limbs": {"L": {"reps": reps, "bestRom": 100, "lastRom": 90}},
+         "calibration": {"L": {"calibrated": False, "rest": 160, "peak": 50}},
+         "workouts": [{"startedAt": 1_700_000_001_000, "endedAt": 1_700_000_050_000, "exercise": "Elbow Curl",
+                       "limbs": {"L": {"reps": reps, "bestRom": 100, "lastRom": 90}}}],
+         "appVersion": "1.0",
+         "events": [{"t": 1.0, "type": "start", "payload": {}}] + [{"t": 2.0 + k, "type": "rep", "payload": {"total": k + 1}} for k in range(reps)]
+                   + [{"t": 9.0, "type": "fall", "payload": {"status": "CONFIRMED"}}] * falls}
+    s.update(over)
+    return s
+
+
+def _sync_client(token="", limiter=None, tunnel_guard=False):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.storage import Storage
+    from app.sync_api import create_sync_router
+    store = Storage(":memory:")
+    app = FastAPI()
+    if tunnel_guard:
+        from app.security import TunnelGuard
+        app.add_middleware(TunnelGuard)
+    app.include_router(create_sync_router(lambda: store, lambda: token, limiter))
+    return TestClient(app), store
+
+
+def test_an_upload_is_stored_once_however_often_it_is_sent():
+    client, store = _sync_client()
+    batch = {"deviceId": "device-1", "sessions": [_sess(1, reps=4, falls=1), _sess(2, reps=2)]}
+    first = client.post("/api/sync/sessions", json=batch)
+    assert first.status_code == 200 and first.json() == {"stored": ["sess-0001-abcdef", "sess-0002-abcdef"], "duplicate": []}
+    again = client.post("/api/sync/sessions", json=batch)                      # the answer was lost, so the phone sends it again
+    assert again.json() == {"stored": [], "duplicate": ["sess-0001-abcdef", "sess-0002-abcdef"]}
+    mixed = client.post("/api/sync/sessions", json={"deviceId": "device-1", "sessions": [_sess(2), _sess(3)]})
+    assert mixed.json() == {"stored": ["sess-0003-abcdef"], "duplicate": ["sess-0002-abcdef"]}
+    listed = client.get("/api/sessions").json()
+    assert listed["total"] == 3
+    assert [s["id"] for s in listed["sessions"]] == ["sess-0003-abcdef", "sess-0002-abcdef", "sess-0001-abcdef"]      # newest first
+    by_id = {s["id"]: s for s in listed["sessions"]}
+    assert by_id["sess-0001-abcdef"]["event_count"] == 1 + 4 + 1                # no event was added twice
+    assert by_id["sess-0001-abcdef"]["reps_total"] == 4 and by_id["sess-0001-abcdef"]["fall_events"] == 1
+    assert by_id["sess-0001-abcdef"]["summary"]["calibration"]["L"]["rest"] == 160
+    assert listed["summary"] == {"sessions": 3, "reps": 4 + 2 + 3, "fall_sessions": 1}
+    assert [e["type"] for e in store.events_of("sess-0001-abcdef")] == ["start", "rep", "rep", "rep", "rep", "fall"]
+
+
+def test_history_is_paged_and_reps_are_added_over_the_workouts_of_a_session():
+    from app.storage import reps_in
+    assert reps_in({"workouts": [{"limbs": {"L": {"reps": 3}, "R": {"reps": 2}}}, {"limbs": {"B": {"reps": 4}}}], "limbs": {"L": {"reps": 99}}}) == 9
+    assert reps_in({"limbs": {"L": {"reps": 5}}}) == 5 and reps_in({}) == 0
+    client, _ = _sync_client()
+    client.post("/api/sync/sessions", json={"deviceId": "d", "sessions": [_sess(i) for i in range(1, 6)]})
+    page = client.get("/api/sessions?limit=2&offset=1").json()
+    assert [s["id"] for s in page["sessions"]] == ["sess-0004-abcdef", "sess-0003-abcdef"]
+    assert page["total"] == 5 and page["limit"] == 2 and page["offset"] == 1
+
+
+def test_the_upload_needs_the_token_when_one_is_set_and_wrong_guesses_are_limited():
+    from app.security import FailureLimiter
+    client, _ = _sync_client(token="s3cret-token", limiter=FailureLimiter(max_fails=3, window_s=60))
+    batch = {"deviceId": "d", "sessions": [_sess(1)]}
+    assert client.post("/api/sync/sessions", json=batch).status_code == 401                          # none given
+    assert client.get("/api/sessions").status_code == 401                                            # history is patient data too
+    assert client.post("/api/sync/sessions", json=batch, headers={"Authorization": "Bearer nope"}).status_code == 401
+    ok = client.post("/api/sync/sessions", json=batch, headers={"Authorization": "Bearer s3cret-token"})
+    assert ok.status_code == 200 and ok.json()["stored"] == ["sess-0001-abcdef"]
+    assert client.get("/api/sessions", headers={"X-Access-Token": "s3cret-token"}).json()["total"] == 1
+    client.post("/api/sync/sessions", json=batch, headers={"X-Access-Token": "wrong-1"})
+    client.post("/api/sync/sessions", json=batch, headers={"X-Access-Token": "wrong-2"})
+    assert client.post("/api/sync/sessions", json=batch, headers={"Authorization": "Bearer s3cret-token"}).status_code == 429   # locked for a minute
+
+
+def test_without_a_token_only_a_direct_caller_may_sync_never_a_tunnel():
+    client, _ = _sync_client(token="", tunnel_guard=True)
+    batch = {"deviceId": "d", "sessions": [_sess(1)]}
+    via = {"x-forwarded-for": "203.0.113.9"}
+    assert client.post("/api/sync/sessions", json=batch).status_code == 200                          # localhost / LAN, as the other desktop routes
+    assert client.post("/api/sync/sessions", json=batch, headers=via).status_code == 403            # reaches the route (allow-listed), which refuses
+    assert client.get("/api/sessions", headers=via).status_code == 403
+    secured, _ = _sync_client(token="tok-tok-tok", tunnel_guard=True)
+    good = {**via, "Authorization": "Bearer tok-tok-tok"}
+    assert secured.post("/api/sync/sessions", json=batch, headers=good).status_code == 200          # through the tunnel, with the token
+    assert secured.get("/api/sessions", headers=good).json()["total"] == 1
+    assert secured.get("/api/sessions", headers=via).status_code == 401
+    other = secured.get("/api/session_that_is_not_allowed", headers=good)
+    assert other.status_code == 403                                                                  # the guard still blocks everything else
+
+
+def test_the_upload_has_size_and_shape_limits_and_a_bad_batch_stores_nothing():
+    from app.sync_api import MAX_BODY_BYTES, MAX_SESSIONS
+    client, store = _sync_client()
+    url = "/api/sync/sessions"
+    huge = {"deviceId": "d", "sessions": [_sess(1)], "pad": "x" * (MAX_BODY_BYTES + 10)}
+    assert client.post(url, json=huge).status_code == 413                                            # by Content-Length
+    def chunks():                                                                                    # no Content-Length: counted as it arrives
+        yield b'{"deviceId":"d","sessions":[],"pad":"'
+        for _ in range(MAX_BODY_BYTES // 1000 + 2):
+            yield b"x" * 1000
+        yield b'"}'
+    assert client.post(url, content=chunks(), headers={"Content-Type": "application/json"}).status_code == 413
+    assert client.post(url, json={"deviceId": "d", "sessions": [_sess(i) for i in range(1, MAX_SESSIONS + 2)]}).status_code == 400
+    assert client.post(url, content=b"{not json", headers={"Content-Type": "application/json"}).status_code == 400
+    assert client.post(url, json=[1, 2]).status_code == 400 and client.post(url, json={"deviceId": "d", "sessions": []}).status_code == 400
+    assert client.post(url, json={"sessions": [_sess(1)]}).status_code == 400                        # no deviceId
+    bad = [
+        _sess(1, id="short"), _sess(1, id="has spaces in it"), _sess(1, exercise=""), _sess(1, startedAt="yesterday"),
+        _sess(1, startedAt=-5), _sess(1, limbs=[]), _sess(1, events=[{"t": 1, "type": "explode", "payload": {}}]),
+        _sess(1, events=[{"t": "1", "type": "rep", "payload": {}}]), _sess(1, events=[{"t": 1, "type": "rep", "payload": []}]),
+        _sess(1, limbs={"L": {"reps": "many"}}), _sess(1, limbs={"L": {"reps": True}}),
+    ]
+    for s in bad:
+        assert client.post(url, json={"deviceId": "d", "sessions": [s]}).status_code == 400, s
+    assert client.post(url, json={"deviceId": "d", "sessions": [_sess(1), _sess(1)]}).status_code == 400          # the same id twice
+    assert client.post(url, json={"deviceId": "d", "sessions": [_sess(2), _sess(3, id="bad id")]}).status_code == 400
+    assert client.get("/api/sessions").json()["total"] == 0                                          # nothing of the failed uploads was kept
+
+
+def test_the_database_is_a_wal_file_that_survives_a_restart():
+    import tempfile
+    from app.storage import Storage
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "data" / "rehab.db"                                                         # the folder is made when missing
+        store = Storage(path)
+        assert store._db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert store.insert_batch("dev", [_sess(1)]) == (["sess-0001-abcdef"], [])
+        store.close()
+        again = Storage(path)
+        assert again.insert_batch("dev", [_sess(1)]) == ([], ["sess-0001-abcdef"])                  # still there: a retry after a restart is harmless
+        assert again.list_sessions()["total"] == 1
+        again.close()
+
+
+def test_the_app_registers_the_sync_routes_and_lets_them_through_a_tunnel():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    from app.security import PUBLIC_API
+    assert {"/api/sync/sessions", "/api/sessions"} <= PUBLIC_API
+    client = TestClient(main.app)
+    via = {"x-forwarded-for": "203.0.113.9"}
+    # through a tunnel the guard lets the request in and the route itself answers (a missing route would be 404): a token is
+    # required, never a silent 200. Nothing is stored, so data/rehab.db is not even created by this test.
+    assert client.get("/api/sessions", headers=via).status_code in (401, 403)
+    assert client.post("/api/sync/sessions", json={}, headers=via).status_code in (401, 403)
+
+
 def test_voice_pause_keeps_the_counts_and_lets_go_resumes_without_a_reset():
     from app.voice.intent import classify_command as c
     from app.voicecmd import interpret

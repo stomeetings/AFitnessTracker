@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import type { VoiceState } from "../useTelemetry";
+import { apiUrl } from "../net";
 import { MIC_CONSTRAINTS, isQuiet, micErrorText, startVoiceCapture, type Capture } from "./voice";
 
 /** The microphone side of voice commands, the same for both modes. The caller says how an utterance travels
@@ -12,7 +13,7 @@ export type VoiceReply = { ok: boolean; text?: string; intent?: string | null; e
 /** Desktop page: one utterance to the backend. Resolves with the backend's answer (errors included). */
 export async function uploadToServer(blob: Blob): Promise<VoiceReply> {
   try {
-    const r = await fetch("/api/voice", { method: "POST", headers: { "Content-Type": blob.type || "audio/webm" }, body: blob });
+    const r = await fetch(apiUrl("/api/voice"), { method: "POST", headers: { "Content-Type": blob.type || "audio/webm" }, body: blob });
     if (!r.ok) return { ok: false, error: r.status === 403 ? "Voice is not available through a tunnel." : `Voice failed (HTTP ${r.status}).` };
     return (await r.json()) as VoiceReply;
   } catch {

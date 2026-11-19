@@ -22,7 +22,9 @@ from urllib.parse import urlsplit
 from starlette.responses import JSONResponse
 
 TUNNEL_HEADERS = (b"x-forwarded-for", b"x-forwarded-host", b"x-forwarded-proto", b"forwarded", b"cf-connecting-ip")
-PUBLIC_API = frozenset({"/api/health", "/api/exercises", "/api/exercise_info", "/ws/session"})
+# "/api/sync/sessions" (a phone's upload) and "/api/sessions" (the history) are reachable through a tunnel, but only with the access
+# token: app/sync_api.py refuses them without it (and refuses a tunnel outright when no token is configured).
+PUBLIC_API = frozenset({"/api/health", "/api/exercises", "/api/exercise_info", "/ws/session", "/api/sync/sessions", "/api/sessions"})
 
 
 def _public_host(host: str) -> bool:

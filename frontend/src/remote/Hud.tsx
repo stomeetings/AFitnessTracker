@@ -21,6 +21,7 @@ export type HudProps = {
   extra?: ReactNode;                                    // the voice chip
   note?: string;                                        // e.g. "calibrated rest 92°": what the standby measured for this person
   lost?: boolean;                                       // the link to the server dropped: show the "Connection lost" banner
+  offline?: boolean;                                    // reps and falls are worked out on this phone, but the server cannot be reached
 };
 
 const TONE = { ok: "bg-emerald-400", warn: "bg-amber-400", bad: "bg-red-500" } as const;
@@ -39,12 +40,19 @@ export function Hud(p: HudProps) {
   const entries = Object.entries(p.reps ?? {});
   const standby = p.counting === false;
   return (
-    <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex flex-col gap-2 bg-gradient-to-b from-black/75 via-black/40 to-transparent p-2 sm:p-3">
+    <div className="pointer-events-none absolute inset-x-0 top-0 z-50 flex flex-col gap-2 bg-gradient-to-b from-black/75 via-black/40 to-transparent p-2 sm:p-3">
       {p.lost && (
         // the tunnel or Wi-Fi dropped: nothing is being counted or watched on the server until it is back (the reps are hidden)
         <div role="alert" className="flex animate-pulse flex-wrap items-center justify-center gap-x-2 rounded-lg bg-red-600 px-3 py-2 text-sm font-bold text-white">
           <WifiOff size={16} /> Connection lost — reconnecting…
           <span className="text-xs font-normal">Reps and fall monitoring are paused</span>
+        </div>
+      )}
+      {p.offline && !p.lost && (
+        // Everything still works (counting, the fall check with its beep and spoken question), but nobody is told about an alarm:
+        // that is said plainly, not hidden. Solid red like the lost-link banner, without the pulse (it stays for a whole workout).
+        <div role="alert" className="flex flex-wrap items-center justify-center gap-x-2 rounded-lg bg-red-700 px-3 py-2 text-sm font-bold text-white">
+          <WifiOff size={16} /> Offline — caregiver will not be notified
         </div>
       )}
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -85,7 +93,7 @@ export function Hud(p: HudProps) {
               <SwitchCamera size={14} /> {p.flipLabel ?? "Flip"}
             </button>
           )}
-          <button onClick={p.onToggleFull} className={btn} aria-label={p.full ? "Exit full screen" : "Full screen"}>
+          <button onClick={p.onToggleFull} className={`${btn} min-h-11 min-w-11 touch-manipulation`} aria-label={p.full ? "Exit full screen" : "Full screen"}>
             {p.full ? <Minimize2 size={14} /> : <Maximize2 size={14} />}{p.full ? "Exit" : "Full screen"}
           </button>
         </div>

@@ -278,6 +278,13 @@ export const isMobileDevice = (userAgent: string, maxTouchPoints: number): boole
 /** On-device pose is the default on phones (no video over the network), the server's models elsewhere. */
 export const defaultInference = (mobile: boolean): InferenceMode => (mobile ? "device" : "server");
 
+/** Who runs the analytics (reps, calibration, falls, escalation): "local" = this phone (works offline), "server" = the backend over
+ *  /ws/session. The bundled (offline-first) APK defaults to local, everything else to the server until parity is proven on phones.
+ *  Local needs the pose computed on this device too: with server-side pose the analytics stay on the server. */
+export type EngineMode = "local" | "server";
+export const defaultEngineMode = (bundled: boolean): EngineMode => (bundled ? "local" : "server");
+export const analyticsLocal = (engine: EngineMode, inference: InferenceMode): boolean => engine === "local" && inference === "device";
+
 /** Short name of a pose model for badges ("yolo" -> "YOLO"). Unknown names are shown as they are. */
 export const engineLabel = (name: string): string =>
   ({ yolo: "YOLO", mediapipe: "MediaPipe", mediapipe_lite: "MediaPipe Lite", device: "On-device MediaPipe" } as Record<string, string>)[name] ?? name;

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { wsUrl } from "./net";
 
 export type Limb = {
   reps: number; state: string; angle: number | null; last_rom: number; best_rom: number;
@@ -47,8 +48,7 @@ export function useTelemetry(enabled = true): { t: Telemetry | null; online: boo
     let timer: number | undefined;
     let closed = false;
     const connect = () => {
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/ws/telemetry`);
+      ws = new WebSocket(wsUrl("/ws/telemetry"));
       ws.onopen = () => setOnline(true);
       ws.onmessage = (e) => setT(JSON.parse(e.data));
       ws.onclose = () => {

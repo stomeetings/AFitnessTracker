@@ -21,5 +21,9 @@ frontend/dist/
 # Screenshots and clips of people (never commit)
 docs/sample/
 
+# Copied in for the offline APK build (frontend/scripts/copy-assets.mjs) and removed again after it
+frontend/public/mediapipe/
+frontend/public/models/
+
 # Written by scripts/build_and_serve_apk.py for the current (temporary) tunnel address; the script recreates it
 frontend/capacitor.config.json

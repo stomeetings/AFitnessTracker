@@ -36,6 +36,8 @@ from app.pipeline.rep_counter import EXERCISES
 from app.remote import create_router
 from app.security import TunnelGuard, is_tunneled
 from app.sessions import EXERCISE_NAMES, Session, SessionManager
+from app.storage import Storage
+from app.sync_api import create_sync_router
 from app.voice import settings
 from app.voicecmd import MAX_AUDIO_BYTES, process_audio
 
@@ -285,6 +287,8 @@ async def lifespan(app: FastAPI):
     worker.stop_flag.set()
     service.stop()
     sessions.close_all()
+    if _storage is not None:
+        _storage.close()
 
 
 app = FastAPI(title="AI Rehab Tracker", lifespan=lifespan)
@@ -292,6 +296,18 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 app.add_middleware(TunnelGuard)      # requests through a tunnel/proxy cannot reach the desktop routes (app/security.py)
 app.include_router(create_router(sessions, service, enabled=_remote_enabled, max_remote=_remote_limit,
                                  token=_remote_token, allowed_origins=_remote_origins, engine_names=lambda: list(ENGINES)))
+_storage: Storage | None = None
+
+
+def get_storage() -> Storage:
+    """data/rehab.db, opened on first use (importing the app must not create files)."""
+    global _storage
+    if _storage is None:
+        _storage = Storage()
+    return _storage
+
+
+app.include_router(create_sync_router(get_storage, _remote_token))     # the phones' upload and the history (app/sync_api.py)
 
 
 class Config(BaseModel):

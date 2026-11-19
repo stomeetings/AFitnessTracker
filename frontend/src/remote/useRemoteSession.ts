@@ -3,16 +3,19 @@ import type { Telemetry } from "../useTelemetry";
 import {
   MAX_QUALITY, ON_DEVICE, SAFETY_COMMANDS, SAFETY_MAX_AGE_MS, SAFETY_QUEUE_MAX, UI_TICK_MS, bboxFromKeypointsInto, canSendFrame, captureSize,
   TIER_SIZE, connectionLost, createTierMonitor, defaultInference, extractToken, initialTier, isMobileDevice, keypointMessage, nextQuality,
-  packFrame, reconnectDelay, tierCeiling, tierConstraints, urgentChange,
-  type CameraTier, type InferenceMode, type Keypoints, type Pose, type Quality,
+  packFrame, reconnectDelay, tierCeiling, tierConstraints, urgentChange, analyticsLocal, defaultEngineMode,
+  type CameraTier, type EngineMode, type InferenceMode, type Keypoints, type Pose, type Quality,
 } from "./logic";
 
 const NO_JOINTS: Keypoints = Object.freeze({}) as Keypoints;     // "nobody in view": one shared empty set, never written to
+import { TOKEN_KEY, apiUrl, isBundled, wsUrl } from "../net";
+import { LocalEngine } from "../engine/localEngine";
+import { recordEngine, type SessionRecorder } from "../store";
+import { setWorkoutActive, syncQueue } from "../sync";
 import { getLandmarker, runLocalLoop, type LoadedLandmarker } from "./onDevicePose";
 import { MIC_CONSTRAINTS, micErrorText } from "./voice";
 import { useVoiceInput, type VoiceReply } from "./useVoiceInput";
 
-const TOKEN_KEY = "remoteToken";
 const saveToken = (v: string) => { try { if (v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); } catch { /* storage blocked: this tab only */ } };
 
 /** The access token: from `?token=...` in the page address (saved, then removed from the address bar) or from an earlier
@@ -28,6 +31,7 @@ function loadToken(): string {
   } catch { return ""; }
 }
 
+const FIRST_ANSWER_GRACE_MS = 25_000;
 const INFERENCE_KEY = "inference";
 /** Who computes the pose: this device (phones by default: no video leaves it) or the server (frames are sent). A choice made on
  *  the badge is remembered; the automatic fallback to the server when on-device pose cannot start is not. */
@@ -39,6 +43,27 @@ function loadInference(): InferenceMode {
   return defaultInference(isMobileDevice(navigator.userAgent, navigator.maxTouchPoints ?? 0));
 }
 const saveInference = (m: InferenceMode) => { try { localStorage.setItem(INFERENCE_KEY, m); } catch { /* storage blocked */ } };
+
+const ENGINE_KEY = "engine";
+/** Who runs the analytics (reps, falls): this phone ("local", works offline) or the server. Default: local in the bundled APK. */
+function loadEngineMode(): EngineMode {
+  try {
+    const saved = localStorage.getItem(ENGINE_KEY);
+    if (saved === "local" || saved === "server") return saved;
+  } catch { /* no storage */ }
+  return defaultEngineMode(isBundled());
+}
+/** The server measures joint angles in 2D when backend/.env has ANGLES_3D=0 (what this project runs with: the phone's 3D world
+ *  landmarks counted worse). The offline engine cannot read that file, so it follows the same choice: 2D unless
+ *  localStorage "angles3d"="1" or the build has VITE_ANGLES_3D=1. */
+function localEngineOptions(): { angles3d: boolean } {
+  let v: string | null = null;
+  try { v = localStorage.getItem("angles3d"); } catch { /* no storage */ }
+  return { angles3d: (v ?? import.meta.env.VITE_ANGLES_3D ?? "0") === "1" };
+}
+// With the analytics on this phone, these commands also go to the server (when linked) so its session state matches: voice "pause"
+// and "let's go" are interpreted there. The fall answers and pause/resume are local only.
+const LOCAL_ONLY = ["ack_fall", "escalate", "test_fall", "pause", "resume"];
 
 /** Browser camera -> /ws/session -> telemetry + keypoints back (backend/app/remote.py has the protocol).
  *  One frame is in flight at a time, so a slow link lowers the frame rate instead of building a queue.
@@ -106,6 +131,23 @@ export function useRemoteSession() {
   // On-device pose: the model runs in this browser and only joint positions are sent (no frames).
   const [inference, setInferenceState] = useState<InferenceMode>(loadInference);
   const inferenceRef = useRef(inference);
+  // Analytics on this phone (frontend/src/engine): the engine lives here while a local session runs; null = the server does it.
+  const [engineMode, setEngineModeState] = useState<EngineMode>(loadEngineMode);
+  const engineModeRef = useRef(engineMode);
+  const localRef = useRef<LocalEngine | null>(null);
+  const seenVersion = useRef(-1);                          // the engine's change counter at the last telemetry push
+  const recorderRef = useRef<SessionRecorder | null>(null);   // writes this session's events to the device (store/), never throws
+  /** The local session is over (stop, or the analytics moved to the server): one last write with the end time. */
+  const endRecording = () => {
+    const r = recorderRef.current;
+    recorderRef.current = null;
+    if (localRef.current) localRef.current.listener = null;
+    setWorkoutActive(false);                                // uploads may run again
+    void r?.end().then(() => syncQueue().trigger());       // the finished session is saved: send it as soon as the server can be reached
+  };
+  // Can the server be reached? Only matters with the analytics on this phone: then a dead link does not stop the workout, but nobody
+  // can be told about a fall. null = not known yet (the first few seconds of a session).
+  const [linkUp, setLinkUp] = useState<boolean | null>(null);
   const [local, setLocal] = useState({ fps: 0, ms: 0, status: "idle" as "idle" | "loading" | "running", delegate: "" });
   // Adaptive camera resolution: the tier the camera runs at, and the monitor that steps it down / up from the model's measured time.
   const mobile = useRef(isMobileDevice(navigator.userAgent, navigator.maxTouchPoints ?? 0)).current;
@@ -146,7 +188,7 @@ export function useRemoteSession() {
   const streamRef = useRef<MediaStream | null>(null);
   const facingRef = useRef<Facing>("user");
   const exerciseRef = useRef<string | null>(null); // re-sent after a reconnect (the server makes a fresh session)
-  const timers = useRef<{ reconnect?: number; pump?: number; ui?: number }>({});
+  const timers = useRef<{ reconnect?: number; pump?: number; ui?: number; link?: number }>({});
   const attempts = useRef(0);
   const wake = useRef<WakeLockSentinel | null>(null);
   const pumpState = useRef({ seq: 0, inflight: false, sentAt: 0, q: MAX_QUALITY as Quality, fps: 0, lastAck: 0, infer: 0, rtt: 0 });
@@ -160,14 +202,26 @@ export function useRemoteSession() {
     if (next.fps !== s.fps || next.rtt !== s.rtt || next.longSide !== s.longSide || next.inferMs !== s.inferMs) { shownStats.current = next; setStats(next); }
   };
   const clearPose = () => poseListener.current?.(null, { w: 0, h: 0 });          // wipe the skeleton: it would look live
+  /** Local analytics: build the telemetry (allocates, so only on a UI tick or when something important changed) and show it. */
+  const pushLocal = () => {
+    const e = localRef.current;
+    if (!e) return;
+    seenVersion.current = e.version;
+    msgRef.current = e.telemetry() as unknown as ServerMsg;
+    flushMsg();
+  };
 
   /** Every UI_TICK_MS while a session is wanted: bring React up to date, and check the tunnel. A quick tunnel can die without the
    *  socket ever noticing, so the socket still reads OPEN while nothing is counted or watched: that is detected here. */
   const uiTick = () => {
+    if (localRef.current) { msgRef.current = localRef.current.telemetry() as unknown as ServerMsg; flushMsg(); flushStats(); return; }   // nothing to watch: no server involved
     flushMsg();
     flushStats();
     if (document.hidden || !opened.current) return;      // a hidden tab sends nothing, so nothing can be missing
-    if (connectionLost(performance.now(), lastRecv.current, lastSent.current)) dropRef.current?.();
+    // Before the first answer of this socket the server may be loading the pose model for this new session (seconds, on CPU):
+    // that is not a dead link, so the first answer gets a long grace. Dropping then made each reconnect load the model again.
+    const grace = pumpState.current.lastAck ? undefined : FIRST_ANSWER_GRACE_MS;
+    if (connectionLost(performance.now(), lastRecv.current, lastSent.current, grace)) dropRef.current?.();
   };
   const startUiTick = () => { if (timers.current.ui === undefined) timers.current.ui = window.setInterval(uiTick, UI_TICK_MS); };
   const stopUiTick = () => { window.clearInterval(timers.current.ui); timers.current.ui = undefined; };
@@ -219,6 +273,8 @@ export function useRemoteSession() {
       if (!want.current) return;
       setError(`On-device pose is not available (${why instanceof Error ? why.message : String(why)}); the server is doing it instead.`);
       inferenceRef.current = "server"; setInferenceState("server");     // not saved: the next visit tries on-device again
+      endRecording();
+      localRef.current = null;                                          // the analytics need the on-device pose: the server takes them over too
       setLocal((l) => ({ ...l, status: "idle" }));
       startPump();
     };
@@ -229,7 +285,7 @@ export function useRemoteSession() {
       fallBack(e);
       return;
     }
-    if (!want.current || inferenceRef.current !== "device" || !opened.current) {     // things changed while the model loaded
+    if (!want.current || inferenceRef.current !== "device" || (!opened.current && !localRef.current)) {     // things changed while the model loaded
       setLocal((l) => ({ ...l, status: "idle" }));
       return;
     }
@@ -245,6 +301,12 @@ export function useRemoteSession() {
         frame.w = w; frame.h = h;
         if (kp && bboxFromKeypointsInto(bbox, kp)) { shown.kp = kp; poseListener.current?.(shown, frame); }   // the skeleton, with no network in between
         else poseListener.current?.(null, frame);
+        const eng = localRef.current;
+        if (eng) {                                                    // the analytics run right here: no message, no network
+          eng.process(kp, world, w, h, tMs / 1000);                   // allocation-free; the same pose the server would get
+          if (eng.version !== seenVersion.current) pushLocal();        // a rep, a fall change, standby <-> counting: shown at once
+          return;
+        }
         const sock = ws.current;
         if (sock && sock.readyState === WebSocket.OPEN && opened.current && sock.bufferedAmount < 65536) {   // never build a backlog
           sock.send(keypointMessage(++kpSeq.current, tMs, w, h, kp ?? NO_JOINTS, kp ? world : undefined));
@@ -253,6 +315,7 @@ export function useRemoteSession() {
       },
       stats: (fps, ms) => {
         setLocal((l) => ({ ...l, fps, ms }));
+        if (localRef.current) localRef.current.latencyMs = ms;
         const next = monitorRef.current?.sample(fps, ms);            // over budget for 3 s: a smaller camera image; 20 s of headroom: back up
         if (next) void applyTier(next);
       },
@@ -276,8 +339,12 @@ export function useRemoteSession() {
   const connect = useCallback(() => {
     if (!want.current) return;
     opened.current = false;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const sock = new WebSocket(`${proto}://${location.host}/ws/session`);
+    if (localRef.current && !navigator.onLine) {              // local analytics and no network: do not even try, check again shortly
+      setLinkUp(false);
+      timers.current.reconnect = window.setTimeout(connect, 3000);
+      return;
+    }
+    const sock = new WebSocket(wsUrl("/ws/session"));
     sock.binaryType = "arraybuffer";
     ws.current = sock;
     // The token goes in the first message, not the address, so it never shows up in server or tunnel logs.
@@ -287,7 +354,15 @@ export function useRemoteSession() {
       if (typeof e.data !== "string") return;
       const m = JSON.parse(e.data) as ServerMsg;
       const p = pumpState.current;
-      if (m.type === "hello") {
+      if (m.type === "hello" && localRef.current) {
+        // The analytics run on this phone; the link is only for voice commands (the server interprets them). Mirror the state the
+        // server must know, so its "pause" / "let's go" make sense, and change nothing else.
+        opened.current = true; attempts.current = 0;
+        window.clearTimeout(timers.current.link); setLinkUp(true);
+        setEngines(m.engines ?? []);
+        if (exerciseRef.current) sock.send(JSON.stringify({ type: "cmd", name: "exercise", value: exerciseRef.current }));
+        if (localRef.current.pipeline.counting) sock.send(JSON.stringify({ type: "cmd", name: "start_session" }));
+      } else if (m.type === "hello") {
         opened.current = true; attempts.current = 0;
         lastSent.current = lastRecv.current;                      // nothing is owed yet
         setError(null); setStatus("live");
@@ -297,6 +372,8 @@ export function useRemoteSession() {
         for (const q of queued) if (performance.now() - q.at < SAFETY_MAX_AGE_MS) sock.send(JSON.stringify({ type: "cmd", name: q.name }));
         startUiTick();
         startActive();
+      } else if (m.type === "t" && localRef.current) {
+        // not expected (no poses are sent while the analytics are local); never let a server reply replace the local numbers
       } else if (m.type === "t") {
         const now = performance.now();
         if (m.ack === p.seq || m.error) p.inflight = false;       // an error reply also frees the pump
@@ -316,7 +393,7 @@ export function useRemoteSession() {
           msgRef.current = m;
           if (urgent) flushMsg();                                 // otherwise the next UI tick shows it
         } else if (m.error) setError(m.error);
-      } else if (m.type === "cmd_result" && !m.ok) {
+      } else if (m.type === "cmd_result" && !m.ok && !localRef.current) {
         if (m.name === "engine") setEngineWanted(null);
         setError(m.error ?? `${m.name} failed`);
       } else if (m.type === "voice") {
@@ -329,6 +406,18 @@ export function useRemoteSession() {
     const closed = (code: number) => {
       if (ws.current !== sock) return;                             // an older socket, or stop() already took care of it
       stopPump();
+      if (localRef.current) {                                      // the analytics run here: only the voice link is down, the session goes on
+        ws.current = null; opened.current = false;
+        setLinkUp(false);
+        if (code === 4401) {                                       // the token is missing or wrong: retrying cannot help; the next start asks for it
+          token.current = ""; saveToken("");
+          setError("Voice link: the access token is missing or wrong.");
+          return;
+        }
+        if (!want.current) return;
+        timers.current.reconnect = window.setTimeout(connect, reconnectDelay(attempts.current++));
+        return;
+      }
       stopLocal();                                                 // restarted by the next hello
       ws.current = null;
       msgRef.current = null; shownMsg.current = null; setMsg(null);   // the reps of a dead session must not look live
@@ -342,9 +431,15 @@ export function useRemoteSession() {
         return;
       }
       if (code === 1013) setError("The server is full or temporarily locked. Retrying…");
+      if (code === 1008) setError("The server refused the connection (remote sessions off, or this address is not allowed).");
       setStatus("reconnecting");
-      if (!opened.current && attempts.current === 0) {            // refused straight away: say why, once
-        fetch("/api/health").then((r) => r.json()).then((h) => { if (h.remote_sessions === false) setError(HEALTH_HINT); }).catch(() => {});
+      if (!opened.current && (attempts.current === 0 || attempts.current === 3)) {   // refused straight away, or still failing: say why
+        fetch(apiUrl("/api/health")).then((r) => r.json()).then((h) => {
+          if (h.remote_sessions === false) setError(HEALTH_HINT);
+          else if (h.remote_auth && !token.current && want.current) {   // the server wants a token and we have none: ask, do not loop
+            stop(); setNeedsToken(true); setError("This server needs an access token.");
+          }
+        }).catch(() => {});
       }
       opened.current = false;
       timers.current.reconnect = window.setTimeout(connect, reconnectDelay(attempts.current++));
@@ -373,14 +468,20 @@ export function useRemoteSession() {
     want.current = false;
     window.clearTimeout(timers.current.reconnect);
     stopPump();
-    ws.current?.close(1000);
-    ws.current = null;
+    const old = ws.current;
+    ws.current = null;                                      // first: its onclose then knows it is stale
+    if (old) { old.onclose = null; old.onerror = null; old.onmessage = null; try { old.close(1000); } catch { /* already gone */ } }
+    dropRef.current = null; opened.current = false;         // nothing of this session may reach the next one
+    lastRecv.current = lastSent.current = performance.now();
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     endVoice();
     releaseWake();
     stopUiTick();
     safetyQueue.current = [];
+    window.clearTimeout(timers.current.link); setLinkUp(null);
+    endRecording();                                         // before the engine goes: the last write reads its final counts
+    localRef.current = null; seenVersion.current = -1;     // the engine (and its counts) goes with the session
     msgRef.current = null; shownMsg.current = null;
     clearPose();
     setStream(null); setMsg(null); setStatus("idle");
@@ -398,9 +499,19 @@ export function useRemoteSession() {
     setError(null); setStatus("starting");
     attempts.current = 0;
     pumpState.current = { seq: 0, inflight: false, sentAt: 0, q: MAX_QUALITY, fps: 0, lastAck: 0, infer: 0, rtt: 0 };
+    // "This phone" means standalone: the pose model must run here too (a desktop browser defaults to the server's), or the server
+    // would still be the counter and a dead link would show "Connection lost". Not saved: the badge choice is left as it was.
+    if (engineModeRef.current === "local" && inferenceRef.current !== "device") { inferenceRef.current = "device"; setInferenceState("device"); }
+    const onPhone = analyticsLocal(engineModeRef.current, inferenceRef.current);     // the reps and falls are worked out on this phone
     try {
-      // Ask before opening the camera: no point in a permission prompt if the server will refuse us anyway.
-      const h = await fetch("/api/health").then((r) => r.json()).catch(() => null);
+      // Ask before opening the camera: no point in a permission prompt if the server will refuse us anyway. Not needed when the
+      // analytics are local: the session must start with no network at all (a dead tunnel would otherwise delay it).
+      // First run with no token saved: ask the server even when the analytics are local (2.5 s cap, so a dead tunnel or no network
+      // still starts the session), or the first-time token prompt never appears and the voice link is refused (4401) silently.
+      const askServer = !onPhone || (!token.current && navigator.onLine);
+      const h = askServer
+        ? await fetch(apiUrl("/api/health"), onPhone ? { signal: AbortSignal.timeout(2500) } : undefined).then((r) => r.json()).catch(() => null)
+        : null;
       if (h?.remote_auth && !token.current) {
         want.current = false;
         setNeedsToken(true); setStatus("idle"); setError("This server needs an access token.");
@@ -416,14 +527,27 @@ export function useRemoteSession() {
       attach(media.stream);
       voice.begin(media.mic, media.micError);
       void holdWake();
-      connect();
+      if (onPhone) {
+        localRef.current = new LocalEngine(exerciseRef.current ?? undefined, localEngineOptions());
+        recorderRef.current = recordEngine(localRef.current);     // keeps the session on this device (IndexedDB)
+        setWorkoutActive(true);                                    // no uploads while the pose loop runs
+        setLinkUp(null);
+        window.clearTimeout(timers.current.link);
+        timers.current.link = window.setTimeout(() => setLinkUp((l) => (l === null ? false : l)), 4000);   // no answer in 4 s: unreachable
+        seenVersion.current = -1;
+        setStatus("live");
+        startUiTick();
+        pushLocal();
+        startActive();             // the model loop, which feeds the engine
+        connect();                 // optional: voice commands (and later the sync) need the server; counting does not
+      } else connect();
     } catch (e) {
       want.current = false;
       setStatus("error");
       setError(e instanceof DOMException && e.name === "NotAllowedError" ? "Camera permission was denied. Allow it in the browser's site settings."
         : e instanceof Error ? e.message : String(e));
     }
-  }, [connect, holdWake]);   // eslint-disable-line react-hooks/exhaustive-deps -- attach/stop are stable in effect
+  }, [connect, holdWake, startActive]);   // eslint-disable-line react-hooks/exhaustive-deps -- attach/stop are stable in effect
 
   const switchCamera = useCallback(async () => {
     if (switching.current) return;
@@ -463,6 +587,23 @@ export function useRemoteSession() {
   const send = useCallback((name: string, value?: string) => {
     if (name === "exercise" && value) exerciseRef.current = value;
     const sock = ws.current;
+    const eng = localRef.current;
+    if (eng) {                                                    // the analytics are on this phone: apply at once, offline too
+      switch (name) {
+        case "exercise": if (value) eng.setExercise(value); break;
+        case "reset": eng.reset(); break;
+        case "ack_fall": eng.ack(); break;
+        case "escalate": eng.escalate(); break;
+        case "test_fall": eng.simulateFall(); break;
+        case "start_session": eng.start(); break;
+        case "stop_session": eng.stop(); break;
+        case "pause": eng.pause(); break;
+        case "resume": eng.resume(); break;
+      }
+      pushLocal();
+      if (!LOCAL_ONLY.includes(name) && sock?.readyState === WebSocket.OPEN && opened.current) sock.send(JSON.stringify({ type: "cmd", name, value }));
+      return;
+    }
     if (sock?.readyState === WebSocket.OPEN && opened.current) {
       sock.send(JSON.stringify({ type: "cmd", name, value }));
       lastSent.current = performance.now();
@@ -491,8 +632,20 @@ export function useRemoteSession() {
     inferenceRef.current = mode;
     setInferenceState(mode);
     saveInference(mode);
+    if (mode === "server" && localRef.current) {                    // frames go to the server, so it must do the analytics too
+      endRecording();
+      localRef.current = null; seenVersion.current = -1;
+      msgRef.current = null; shownMsg.current = null; setMsg(null);
+    }
     if (want.current && opened.current) startActive();
   }, [startActive]);
+
+  /** Who runs the analytics from the next session on (the choice is remembered). */
+  const setEngineMode = useCallback((m: EngineMode) => {
+    engineModeRef.current = m;
+    setEngineModeState(m);
+    try { localStorage.setItem(ENGINE_KEY, m); } catch { /* storage blocked */ }
+  }, []);
 
   /** The model badge: "device" = this phone's own MediaPipe; anything else is one of the server's models. */
   const setModel = useCallback((name: string) => {
@@ -529,6 +682,7 @@ export function useRemoteSession() {
     videoRef, status, error, stream, facing, stats, telemetry, needsToken,
     engine, engines, engineWanted, setEngine,
     inference, local, models, model, modelMs, modelWanted, setModel, setPoseListener,
+    engineMode, setEngineMode, analyticsLocal: analyticsLocal(engineMode, inference), linkUp,
     voice,
     frame: msg?.frame ?? null,
     camera: { tier: cameraTier, ...TIER_SIZE[cameraTier] },       // what the camera was last asked for (the browser picks its nearest mode)

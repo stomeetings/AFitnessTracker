@@ -12,6 +12,12 @@ import { VOICE_HELP, VoiceChip } from "./remote/VoiceChip";
 import { intentEffects } from "./remote/voice";
 import { cue, cueThen, runCountdown, unlockSpeech } from "./cues";
 import { preloadLandmarker } from "./remote/onDevicePose";
+import { apiUrl, isBundled } from "./net";
+import { EXERCISES, EXERCISE_NAMES } from "./engine/exercises";
+
+/** The guide's table from the bundled exercise JSON: same shape as GET /api/exercise_info. */
+const BUNDLED_INFO: Record<string, { rest: number; peak: number; sides: string[] }> =
+  Object.fromEntries(EXERCISE_NAMES.map((n) => [n, { rest: EXERCISES[n].rest, peak: EXERCISES[n].peak, sides: Object.keys(EXERCISES[n].joints) }]));
 import { useTelemetry, type Limb } from "./useTelemetry";
 
 const ENGINES = [
@@ -24,7 +30,7 @@ type CamScan = { active: number; available: number[]; cameras: CamInfo[]; device
 const SIDE_LABEL: Record<string, string> = { L: "Left", R: "Right", B: "Bilateral" };
 
 const post = (url: string, body?: unknown) =>
-  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  fetch(apiUrl(url), { method: "POST", headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
 
 function Card({ icon, label, value, sub, accent }: { icon: React.ReactNode; label: string; value: React.ReactNode; sub?: React.ReactNode; accent?: string }) {
   return (
@@ -68,7 +74,7 @@ function CameraPicker({ active, backend, error }: { active: number | undefined; 
   const [wanted, setWanted] = useState<number | null>(null);
   const rescan = () => {
     setScanning(true);
-    fetch("/api/cameras").then((r) => r.json()).then(setScan).catch(() => {}).finally(() => setScanning(false));
+    fetch(apiUrl("/api/cameras")).then((r) => r.json()).then(setScan).catch(() => {}).finally(() => setScanning(false));
   };
   useEffect(rescan, []);
   useEffect(() => { if (wanted !== null && (active === wanted || error)) setWanted(null); }, [active, error, wanted]);  // switch finished, fell back, or failed
@@ -118,7 +124,8 @@ export default function App() {
   // The laptop itself starts in "Server camera"; any other address (a phone, a tunnel) starts in "This device".
   const [mode, setMode] = useState<"local" | "device">(() => {
     try { const saved = localStorage.getItem("mode"); if (saved === "device" || saved === "local") return saved; } catch { /* no storage */ }
-    return isLocalHost(location.hostname) ? "local" : "device";
+    // the bundled APK is served from https://localhost but is a phone: it always starts with its own camera
+    return isLocalHost(location.hostname) && !isBundled() ? "local" : "device";
   });
   const device = mode === "device";
   const chooseMode = (m: "local" | "device") => {
@@ -139,10 +146,15 @@ export default function App() {
     escalate: () => (device ? remote.send("escalate") : void post("/api/fall/escalate")),
     testFall: () => (device ? remote.send("test_fall") : void post("/api/fall/test")),
   };
-  const [exercises, setExercises] = useState<string[]>([]);
-  useEffect(() => { fetch("/api/exercises").then((r) => r.json()).then(setExercises).catch(() => {}); }, []);
-  const [guideInfo, setGuideInfo] = useState<Record<string, { rest: number; peak: number; sides?: string[] }>>({});
-  useEffect(() => { fetch("/api/exercise_info").then((r) => r.json()).then(setGuideInfo).catch(() => {}); }, []);
+  // "This device": the exercise list and the guide come from the bundled table (the same JSON the local engine counts with), so
+  // nothing is fetched and a dead network cannot delay the screen. "Server camera": the server's table, only when online.
+  const [exercises, setExercises] = useState<string[]>(EXERCISE_NAMES);
+  const [guideInfo, setGuideInfo] = useState<Record<string, { rest: number; peak: number; sides?: string[] }>>(BUNDLED_INFO);
+  useEffect(() => {
+    if (device || !navigator.onLine) { setExercises(EXERCISE_NAMES); setGuideInfo(BUNDLED_INFO); return; }
+    fetch(apiUrl("/api/exercises")).then((r) => r.json()).then(setExercises).catch(() => {});
+    fetch(apiUrl("/api/exercise_info")).then((r) => r.json()).then(setGuideInfo).catch(() => {});
+  }, [device]);
   const [guideOpen, setGuideOpen] = useState(false);
   const guide = t ? guideInfo[t.exercise] : undefined;
 
@@ -214,14 +226,15 @@ export default function App() {
     console.info("[voice] heard", JSON.stringify(voice.heard.text), "-> intent:", heardIntent);   // diagnostic: what the server understood
     if (!heardIntent) return;                        // talk that was not a command must not cancel one already waiting
     // Pause / resume act at once (no 700 ms read-the-chip delay): the server has already changed state when it answered.
-    if (heardIntent === "pause_session") { stopCount.current?.(); setPaused(true); cue("pause", true); return; }
-    if (heardIntent === "resume_session") { setPaused(false); cue("resume", true); setGuideOpen(false); return; }
+    // With the analytics on this phone the engine here does it (the server only interpreted the words).
+    if (heardIntent === "pause_session") { stopCount.current?.(); setPaused(true); cue("pause", true); if (device && remote.analyticsLocal) remote.send("pause"); return; }
+    if (heardIntent === "resume_session") { setPaused(false); cue("resume", true); setGuideOpen(false); if (device && remote.analyticsLocal) remote.send("resume"); return; }
     if (heardIntent === "stop_session") setPaused(false);
     // The chip shows `Heard: "..."` right away; the change itself follows a moment later so it can be read first.
     window.clearTimeout(commandTimer.current);       // a newer command replaces an older one that has not run yet
     commandTimer.current = window.setTimeout(() => {
       const fx = intentEffects(heardIntent, device);
-      if (heardIntent === "start_session") countdown();
+      if (heardIntent === "start_session") { countdown(); if (device && remote.analyticsLocal) remote.send("start_session"); }
       console.info("[voice] applying", heardIntent, fx);
       // the Exercise Guide: the same state the Info button sets. Only "show/hide preview" announce it; a start, resume or stop
       // that closes the guide does so silently (the countdown or "Paused" is speaking).
@@ -235,8 +248,8 @@ export default function App() {
   useEffect(() => {
     const was = lastStatus.current;
     lastStatus.current = remote.status;
-    if (remote.status === "idle" && was !== "idle" && was !== "starting") { setGuideOpen(false); setPaused(false); }
-  }, [remote.status]);
+    if (remote.status === "idle" && was !== "idle" && was !== "starting") { setGuideOpen(false); setPaused(false); void fs.exit(); }   // a finished session leaves full screen too
+  }, [remote.status]);   // eslint-disable-line react-hooks/exhaustive-deps -- fs.exit is stable
   // Server camera: the browser microphone is opt-in (a tap; remembered, and restarted by itself when the browser has
   // already granted it). While the fall dialog is open the BACKEND's microphone answers it, so the browser releases its own.
   const toggleLocalVoice = () => {
@@ -326,7 +339,7 @@ export default function App() {
               full={fs.full} onToggleFull={fs.toggle} onStart={startSession} onPause={pauseSession} />
           ) : (
             <>
-              <img src="/api/video_feed" alt="live feed"
+              <img src={apiUrl("/api/video_feed")} alt="live feed"
                 className={`block w-full object-contain ${fs.full ? "h-full" : "aspect-[4/3]"} ${hideVideo ? "invisible" : ""}`} />
               <Hud
                 status={online ? (t?.pose_visible ? `LIVE · ${t?.posture ?? "pose"}` : "LIVE · no pose") : "OFFLINE"}

@@ -3,8 +3,7 @@
   "appName": "AI Fitness Tracker",
   "webDir": "dist",
   "server": {
-    "url": "https://pray-livecam-stays-plastics.trycloudflare.com",
-    "cleartext": false
+    "androidScheme": "https"
   },
   "android": {
     "allowMixedContent": false

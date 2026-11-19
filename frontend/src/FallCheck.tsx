@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, VolumeX } from "lucide-react";
 import { holdQuiet } from "./remote/voice";
+import { apiUrl } from "./net";
 import type { FallAlert, VoiceState } from "./useTelemetry";
 
 /** Full-screen "Are you okay?" check shown while the backend's fall escalation is in COUNTDOWN or ALERTED.
@@ -33,13 +34,13 @@ function say(text: string, onDone?: () => void) {
   speechSynthesis.speak(u);
 }
 
-const post = (url: string) => { fetch(url, { method: "POST" }).catch(() => {}); };
+const post = (url: string) => { fetch(apiUrl(url), { method: "POST" }).catch(() => {}); };
 
 // DEBUG (temporary): the browser records no audio. Its only part in voice is this request; the microphone is opened
 // by the backend (see the "voice:" lines in the backend terminal).
 const startListening = () => {
   console.log("[voice] DEBUG: asking the backend to open the microphone");
-  fetch("/api/fall/listen", { method: "POST" })
+  fetch(apiUrl("/api/fall/listen"), { method: "POST" })
     .then((r) => r.json())
     .then((j) => console.log("[voice] DEBUG: /api/fall/listen answered", j))
     .catch((e) => console.warn("[voice] DEBUG: /api/fall/listen failed", e));

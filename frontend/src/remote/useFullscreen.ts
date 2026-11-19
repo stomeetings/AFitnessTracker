@@ -37,7 +37,8 @@ export function useFullscreen() {
 
   const exit = useCallback(async () => {
     setFallback(false);
-    if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
+    setNative(false);       // reset our state even when the WebView never fires `fullscreenchange` or exitFullscreen throws
+    try { if (document.fullscreenElement) await document.exitFullscreen(); } catch { /* already out, or refused: state is reset above */ }
   }, []);
 
   const toggle = useCallback(() => { void (full ? exit() : enter()); }, [full, enter, exit]);
